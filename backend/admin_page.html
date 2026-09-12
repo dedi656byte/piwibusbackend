@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="piwibus-admin-version" content="20260625-live-timeout-v1" />
+    <title>Piwibus Admin</title>
+    <link rel="stylesheet" href="/admin/styles.20260625-live-timeout-v1.css" />
+    <script src="/admin/chart.umd.min.20260625-live-timeout-v1.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section id="loginView" class="login-view">
+        <div class="login-panel">
+          <div class="brand-mark">
+            <span class="brand-bus">🚌</span>
+          </div>
+          <h1>Piwibus Admin</h1>
+          <p>Supervision temps réel, modération et statistiques métier.</p>
+          <form id="loginForm" class="stack">
+            <label>
+              Email administrateur
+              <input id="emailInput" type="email" autocomplete="username" required />
+            </label>
+            <label>
+              Mot de passe
+              <input
+                id="passwordInput"
+                type="password"
+                autocomplete="current-password"
+                required
+              />
+            </label>
+            <button type="submit">Se connecter</button>
+            <output id="loginError" class="error-text"></output>
+          </form>
+        </div>
+      </section>
+
+      <section id="dashboardView" class="dashboard-view is-hidden">
+        <!-- SIDEBAR NAVIGATION -->
+        <aside class="sidebar" aria-label="Navigation latérale admin">
+          <div class="sidebar-brand">
+            <div class="sidebar-brand-icon">🚌</div>
+            <div>
+              <div class="sidebar-brand-name">Piwibus</div>
+              <div class="sidebar-brand-sub">Console Admin</div>
+            </div>
+          </div>
+
+          <div class="sidebar-section">Opérations</div>
+          <nav class="tabs" aria-label="Sections admin">
+            <button class="tab is-active" data-target="overviewPanel">
+              <span class="tab-icon">⊞</span>
+              <span>Dashboard</span>
+            </button>
+            <button class="tab" data-target="mapPanel">
+              <span class="tab-icon">🗺</span>
+              <span>Carte</span>
+            </button>
+            <button class="tab" data-target="tripsPanel">
+              <span class="tab-icon">▶</span>
+              <span>Trajets live</span>
+            </button>
+
+            <div class="sidebar-section" style="margin-top: 8px;">Modération</div>
+            <button class="tab" data-target="usersPanel">
+              <span class="tab-icon">👤</span>
+              <span>Utilisateurs</span>
+            </button>
+            <button class="tab" data-target="reportsPanel">
+              <span class="tab-icon">⚠</span>
+              <span>Alertes</span>
+            </button>
+
+            <div class="sidebar-section" style="margin-top: 8px;">Catalogue</div>
+            <button class="tab" data-target="catalogPanel">
+              <span class="tab-icon">≡</span>
+              <span>Lignes & calques</span>
+            </button>
+            <button class="tab" data-target="eventsPanel">
+              <span class="tab-icon">◷</span>
+              <span>Événements</span>
+            </button>
+          </nav>
+
+          <div class="sidebar-footer">
+            <div class="sidebar-user">
+              <div class="sidebar-avatar">A</div>
+              <div>
+                <div class="sidebar-user-name">Administrateur</div>
+                <div class="sidebar-user-sub">Superviseur</div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- MAIN COLUMN -->
+        <div class="main-col">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Piwibus Operations</p>
+              <h1>Console admin</h1>
+            </div>
+            <div class="topbar-actions">
+              <span id="connectionState" class="status-dot">hors ligne</span>
+              <button id="refreshButton" class="ghost-button" type="button">Actualiser</button>
+              <button id="logoutButton" class="danger-button" type="button">Quitter</button>
+            </div>
+          </header>
+
+          <section id="overviewPanel" class="panel">
+            <div id="summaryCards" class="summary-grid"></div>
+            <div class="grid-two">
+              <article class="card">
+                <div class="card-title">
+                  <h2>Qualité GPS</h2>
+                  <span id="gpsUpdatedAt"></span>
+                </div>
+                <div id="gpsQuality" class="metric-list"></div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>État backend</h2>
+                  <span id="backendStorage"></span>
+                </div>
+                <div id="backendMetrics" class="metric-list"></div>
+              </article>
+            </div>
+            <article class="card">
+              <div class="card-title">
+                <h2>À surveiller</h2>
+                <span>priorités opérationnelles</span>
+              </div>
+              <div id="attentionList" class="attention-grid"></div>
+            </article>
+            <div class="grid-two">
+              <article class="card">
+                <div class="card-title">
+                  <h2>Qualité & coût trajets</h2>
+                  <span>notes, likes, chat, data</span>
+                </div>
+                <div id="qualityMetrics" class="metric-list"></div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>Parc mobile</h2>
+                  <span>versions & appareils</span>
+                </div>
+                <div id="deviceMetrics" class="metric-list"></div>
+              </article>
+            </div>
+            <article class="card">
+              <div class="card-title">
+                <h2>Lignes prioritaires</h2>
+                <span>live, alertes, audience</span>
+              </div>
+              <div id="priorityLines" class="priority-lines"></div>
+            </article>
+            <article class="card">
+              <div class="card-title">
+                <h2>Statistiques détaillées</h2>
+                <span>jour / semaine / mois</span>
+              </div>
+              <div id="detailedStats" class="stats-grid"></div>
+            </article>
+            <div id="chartsRow" class="charts-grid">
+              <article class="card">
+                <div class="card-title">
+                  <h2>Inscriptions</h2>
+                  <span>7 derniers jours</span>
+                </div>
+                <div class="chart-wrap">
+                  <canvas id="registrationsChart"></canvas>
+                </div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>Trajets démarrés</h2>
+                  <span>jour / semaine / mois</span>
+                </div>
+                <div class="chart-wrap">
+                  <canvas id="tripsStartedChart"></canvas>
+                </div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>Bilan trajets</h2>
+                  <span>cumul</span>
+                </div>
+                <div class="chart-wrap">
+                  <canvas id="tripsOutcomeChart"></canvas>
+                </div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>Signalements</h2>
+                  <span>par statut</span>
+                </div>
+                <div class="chart-wrap">
+                  <canvas id="reportsChart"></canvas>
+                </div>
+              </article>
+              <article class="card">
+                <div class="card-title">
+                  <h2>Plateformes</h2>
+                  <span>appareils</span>
+                </div>
+                <div class="chart-wrap">
+                  <canvas id="platformChart"></canvas>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section id="mapPanel" class="panel is-hidden">
+            <article class="card map-card">
+              <div class="card-title">
+                <div>
+                  <h2>Carte opérations</h2>
+                  <span>lignes SOTRA et trajets diffusés en temps réel</span>
+                </div>
+                <span id="mapStatus">chargement carte</span>
+              </div>
+              <div class="map-toolbar">
+                <label>
+                  Ligne
+                  <select id="mapLineFilter">
+                    <option value="">Toutes les lignes</option>
+                  </select>
+                </label>
+                <label>
+                  Proximité autour de la ligne
+                  <select id="mapUserRadius">
+                    <option value="250">250 m</option>
+                    <option value="500">500 m</option>
+                    <option value="1000" selected>1000 m</option>
+                    <option value="2000">2000 m</option>
+                    <option value="5000">5000 m</option>
+                  </select>
+                </label>
+                <label class="checkbox-row">
+                  <input id="mapLiveOnly" type="checkbox" />
+                  Afficher seulement les lignes live
+                </label>
+                <label class="checkbox-row">
+                  <input id="mapFollowLive" type="checkbox" checked />
+                  Adapter la vue aux trajets actifs
+                </label>
+                <label class="checkbox-row">
+                  <input id="mapShowUsers" type="checkbox" checked />
+                  Afficher les utilisateurs
+                </label>
+                <button id="mapRefreshButton" class="ghost-button" type="button">
+                  Recharger les traces
+                </button>
+              </div>
+              <div class="map-layout">
+                <div id="adminMapShell" class="admin-map-shell">
+                  <canvas id="adminMapCanvas" aria-label="Carte admin des lignes et trajets live" tabindex="0"></canvas>
+                  <div class="map-controls" aria-label="Contrôles de carte">
+                    <button id="mapZoomInButton" type="button" title="Zoom avant" aria-label="Zoom avant">+</button>
+                    <button id="mapZoomOutButton" type="button" title="Zoom arrière" aria-label="Zoom arrière">-</button>
+                    <button id="mapNorthButton" type="button" title="Nord en haut" aria-label="Nord en haut">Nord</button>
+                    <button id="mapCenterButton" type="button" title="Recentrer la carte" aria-label="Recentrer la carte">Centrer</button>
+                    <button id="mapTilesButton" type="button" title="Masquer le fond OpenStreetMap" aria-label="Masquer le fond OpenStreetMap" aria-pressed="true">Fond OSM</button>
+                    <button id="mapExpandButton" type="button" title="Agrandir la carte" aria-label="Agrandir la carte">Agrandir</button>
+                  </div>
+                  <div id="mapTooltip" class="map-tooltip is-hidden"></div>
+                  <div class="map-attribution">
+                    <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">
+                      © OpenStreetMap contributors
+                    </a>
+                  </div>
+                </div>
+                <aside class="map-side-panel">
+                  <div class="map-side-title">
+                    <strong>Trajets live</strong>
+                    <span id="mapLiveCount">0 actif</span>
+                  </div>
+                  <div id="mapLiveList" class="map-live-list"></div>
+                  <div class="map-side-title">
+                    <strong>Utilisateurs actifs</strong>
+                    <span id="mapUserCount">0</span>
+                  </div>
+                  <div id="mapUserList" class="map-live-list"></div>
+                  <div class="map-side-title">
+                    <strong>Lignes visibles</strong>
+                    <span id="mapLineCount">0 ligne</span>
+                  </div>
+                  <div id="mapLegend" class="map-legend"></div>
+                </aside>
+              </div>
+            </article>
+          </section>
+
+          <section id="tripsPanel" class="panel is-hidden">
+            <article class="card">
+              <div class="card-title">
+                <h2>Trajets live actifs</h2>
+                <span id="liveTripCount"></span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Ligne</th>
+                      <th>Étoile</th>
+                      <th>Observateurs</th>
+                      <th>Vitesse</th>
+                      <th>Distance</th>
+                      <th>GPS</th>
+                      <th>Qualité</th>
+                      <th>Social / chat</th>
+                      <th>Motif</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="liveTripsTable"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-title">
+                <h2>Historique des diffusions</h2>
+                <span id="tripHistoryCount"></span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Ligne</th>
+                      <th>Étoile</th>
+                      <th>Période</th>
+                      <th>Durée</th>
+                      <th>Distance</th>
+                      <th>Observateurs</th>
+                      <th>Internet</th>
+                      <th>Note</th>
+                      <th>Social / chat</th>
+                      <th>Motif</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="tripHistoryTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+
+          <section id="usersPanel" class="panel is-hidden">
+            <article class="card">
+              <div class="card-title">
+                <h2>Utilisateurs</h2>
+                <input id="userSearch" class="search-input" placeholder="Rechercher..." />
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Nom</th>
+                      <th>Email</th>
+                      <th>Rôle</th>
+                      <th>Statut</th>
+                      <th>Dernière activité</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="usersTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+
+          <section id="reportsPanel" class="panel is-hidden">
+            <article class="card">
+              <div class="card-title">
+                <h2>Alertes publiques</h2>
+                <span id="reportCount"></span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Ligne</th>
+                      <th>Bus</th>
+                      <th>Reporteur</th>
+                      <th>Statut</th>
+                      <th>Confiance</th>
+                      <th>Note</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="reportsTable"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-title">
+                <h2>Envoyer une notification</h2>
+                <span id="notificationResult"></span>
+              </div>
+              <form id="notificationForm" class="notification-grid">
+                <label>
+                  Cible
+                  <select id="targetType">
+                    <option value="all">Tous les appareils</option>
+                    <option value="trip">Trajet</option>
+                    <option value="line">Ligne</option>
+                    <option value="user">Utilisateur</option>
+                    <option value="session">Session</option>
+                  </select>
+                </label>
+                <label>
+                  Identifiant cible
+                  <input id="targetId" placeholder="trip-..., code ligne, user id..." />
+                </label>
+                <label>
+                  Titre
+                  <input id="notificationTitle" value="Message Piwibus" required />
+                </label>
+                <label>
+                  Message
+                  <input id="notificationBody" required />
+                </label>
+                <button type="submit">Envoyer</button>
+              </form>
+            </article>
+          </section>
+
+          <section id="catalogPanel" class="panel is-hidden">
+            <article class="card">
+              <div class="card-title">
+                <h2>Lignes, arrêts et calques</h2>
+                <input id="lineSearch" class="search-input" placeholder="Filtrer une ligne..." />
+              </div>
+              <div id="layersList" class="layers-list"></div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Ligne</th>
+                      <th>Itinéraire</th>
+                      <th>Trajets</th>
+                      <th>Distance</th>
+                      <th>Alertes</th>
+                      <th>Observateurs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="linesTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+
+          <section id="eventsPanel" class="panel is-hidden">
+            <article class="card">
+              <div class="card-title">
+                <h2>Historique important</h2>
+                <span id="eventCount"></span>
+              </div>
+              <div id="eventsList" class="events-list"></div>
+            </article>
+          </section>
+        </div><!-- /.main-col -->
+      </section>
+    </main>
+
+    <dialog id="stopDialog">
+      <form method="dialog" class="dialog-card">
+        <h2>Arrêter le trajet live</h2>
+        <p id="stopTripLabel"></p>
+        <label>
+          Motif envoyé à l'Étoile et aux observateurs
+          <textarea id="stopReason" rows="4"></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button value="cancel" class="ghost-button" type="submit">Annuler</button>
+          <button id="confirmStopButton" value="default" class="danger-button" type="button">
+            Arrêter le trajet
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/admin/app.20260625-live-timeout-v1.js"></script>
+  </body>
+</html>

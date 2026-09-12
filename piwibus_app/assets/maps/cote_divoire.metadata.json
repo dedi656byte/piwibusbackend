@@ -1,0 +1,28 @@
+{
+  "name": "Piwibus Abidjan offline vector map",
+  "status": "filtered",
+  "source": "https://download.geofabrik.de/africa/ivory-coast-latest.osm.pbf",
+  "output": "assets/maps/cote_divoire.mbtiles",
+  "schema": [
+    "water",
+    "landuse",
+    "boundaries",
+    "roads",
+    "buildings",
+    "places",
+    "pois"
+  ],
+  "minzoom": 5,
+  "maxzoom": 15,
+  "bounds": [
+    -4.42,
+    5.08,
+    -3.62,
+    5.62
+  ],
+  "tile_count": 5160,
+  "size_bytes": 25239552,
+  "size_mb": 24.07,
+  "generated_at": "2026-06-05T18:50:04.710170+00:00",
+  "attribution": "OpenStreetMap contributors"
+}

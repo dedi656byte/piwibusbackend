@@ -1,0 +1,8 @@
+@"
+.env
+build/
+.dart_tool/
+data/*.json
+graphify-out/
+*.snapshot
+"@ | Out-File -FilePath .gitignore -Encoding utf8

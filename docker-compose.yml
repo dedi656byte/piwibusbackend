@@ -1,0 +1,136 @@
+x-piwibus-logging: &piwibus-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    logging: *piwibus-logging
+    environment:
+      POSTGRES_DB: piwibus
+      POSTGRES_USER: piwibus
+      POSTGRES_PASSWORD: ${PIWIBUS_POSTGRES_PASSWORD:-piwibus_dev_password}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U piwibus -d piwibus && psql -U piwibus -d piwibus -tAc \"SELECT NOT pg_is_in_recovery()\" | grep -q t",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    volumes:
+      - piwibus_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    logging: *piwibus-logging
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+        "--stop-writes-on-bgsave-error",
+        "no",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli SET piwibus:healthcheck ok EX 30 >/dev/null && redis-cli PING | grep -q PONG",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    logging: *piwibus-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PIWIBUS_ENV: ${PIWIBUS_ENV:-development}
+      PIWIBUS_BACKEND_DIR: /app/backend
+      PIWIBUS_BACKEND_HOST: 0.0.0.0
+      PIWIBUS_BACKEND_PORT: 8080
+      PIWIBUS_CSV_PATH: ${PIWIBUS_CSV_PATH:-}
+      PIWIBUS_DATABASE_URL: postgres://piwibus:${PIWIBUS_POSTGRES_PASSWORD:-piwibus_dev_password}@postgres:5432/piwibus
+      PIWIBUS_REDIS_URL: redis://redis:6379/0
+      PIWIBUS_CORS_ORIGIN: ${PIWIBUS_CORS_ORIGIN:-*}
+      PIWIBUS_ADMIN_EMAIL: ${PIWIBUS_ADMIN_EMAIL:-}
+      PIWIBUS_ADMIN_PASSWORD: ${PIWIBUS_ADMIN_PASSWORD:-}
+      PIWIBUS_ADMIN_NAME: ${PIWIBUS_ADMIN_NAME:-Administrateur Piwibus}
+      PIWIBUS_ADMIN_PHONE: ${PIWIBUS_ADMIN_PHONE:-}
+      PIWIBUS_JWT_SECRET: ${PIWIBUS_JWT_SECRET:-change-me-local-dev-secret-with-32-plus-chars}
+      PIWIBUS_RATE_LIMIT_PER_MINUTE: 240
+      PIWIBUS_TRUST_PROXY_HEADERS: "true"
+      PIWIBUS_FIREBASE_PROJECT_ID: ${PIWIBUS_FIREBASE_PROJECT_ID:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      PIWIBUS_PASSWORD_RESET_SHOW_CODE: ${PIWIBUS_PASSWORD_RESET_SHOW_CODE:-false}
+      PIWIBUS_SMTP_HOST: ${PIWIBUS_SMTP_HOST:-}
+      PIWIBUS_SMTP_PORT: ${PIWIBUS_SMTP_PORT:-587}
+      PIWIBUS_SMTP_USERNAME: ${PIWIBUS_SMTP_USERNAME:-}
+      PIWIBUS_SMTP_PASSWORD: ${PIWIBUS_SMTP_PASSWORD:-}
+      PIWIBUS_SMTP_SSL: ${PIWIBUS_SMTP_SSL:-false}
+      PIWIBUS_SMTP_ALLOW_INSECURE: ${PIWIBUS_SMTP_ALLOW_INSECURE:-false}
+      PIWIBUS_MAIL_FROM: ${PIWIBUS_MAIL_FROM:-}
+      PIWIBUS_MAIL_FROM_NAME: ${PIWIBUS_MAIL_FROM_NAME:-Piwibus}
+    expose:
+      - "8080"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    logging: *piwibus-logging
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:8080:80"
+    volumes:
+      - ./deploy/nginx/piwibus.conf:/etc/nginx/conf.d/default.conf:ro
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    logging: *piwibus-logging
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    logging: *piwibus-logging
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-change-me-grafana-admin-password}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - piwibus_grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  piwibus_postgres_data:
+  piwibus_grafana_data:

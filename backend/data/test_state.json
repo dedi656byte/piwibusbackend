@@ -1,0 +1,117 @@
+﻿{
+    "sessions":  {
+                     "test-session-1":  {
+                                            "currentUser":  {
+                                                                "id":  "user-1",
+                                                                "fullName":  "Alice Test",
+                                                                "email":  "alice@test.local",
+                                                                "primaryRole":  "etoile",
+                                                                "status":  "actif"
+                                                            },
+                                            "currentLocation":  {
+                                                                    "lat":  5.34,
+                                                                    "lng":  -4.01,
+                                                                    "timestamp":  "2026-07-01T12:00:00Z"
+                                                                },
+                                            "activeRole":  "etoile",
+                                            "section":  "carte",
+                                            "searchQuery":  "",
+                                            "selectedLineCode":  "",
+                                            "selectedTripId":  "",
+                                            "favoriteLineCodes":  [
+
+                                                                  ],
+                                            "lastSeenAt":  "2026-07-01T12:00:00Z"
+                                        },
+                     "test-session-2":  {
+                                            "currentUser":  {
+                                                                "id":  "user-2",
+                                                                "fullName":  "Bob Test",
+                                                                "email":  "bob@test.local",
+                                                                "primaryRole":  "etoile",
+                                                                "status":  "actif"
+                                                            },
+                                            "currentLocation":  {
+                                                                    "lat":  5.345,
+                                                                    "lng":  -4.005,
+                                                                    "timestamp":  "2026-07-01T11:58:00Z"
+                                                                },
+                                            "activeRole":  "etoile",
+                                            "section":  "carte",
+                                            "searchQuery":  "",
+                                            "selectedLineCode":  "",
+                                            "selectedTripId":  "",
+                                            "favoriteLineCodes":  [
+
+                                                                  ],
+                                            "lastSeenAt":  "2026-07-01T12:00:00Z"
+                                        },
+                     "test-session-3":  {
+                                            "currentUser":  {
+                                                                "id":  "user-3",
+                                                                "fullName":  "Charlie Test",
+                                                                "email":  "charlie@test.local",
+                                                                "primaryRole":  "etoile",
+                                                                "status":  "actif"
+                                                            },
+                                            "currentLocation":  {
+                                                                    "lat":  5.35,
+                                                                    "lng":  -4.01,
+                                                                    "timestamp":  "2026-07-01T11:59:30Z"
+                                                                },
+                                            "activeRole":  "etoile",
+                                            "section":  "carte",
+                                            "searchQuery":  "",
+                                            "selectedLineCode":  "",
+                                            "selectedTripId":  "",
+                                            "favoriteLineCodes":  [
+
+                                                                  ],
+                                            "lastSeenAt":  "2026-07-01T12:00:00Z"
+                                        }
+                 },
+    "users":  [
+                  {
+                      "id":  "user-1",
+                      "fullName":  "Alice Test",
+                      "email":  "alice@test.local",
+                      "primaryRole":  "etoile",
+                      "status":  "actif",
+                      "createdAt":  "2026-07-01T12:00:00Z",
+                      "lastSeenAt":  "2026-07-01T12:00:00Z"
+                  },
+                  {
+                      "id":  "user-2",
+                      "fullName":  "Bob Test",
+                      "email":  "bob@test.local",
+                      "primaryRole":  "etoile",
+                      "status":  "actif",
+                      "createdAt":  "2026-07-01T12:00:00Z",
+                      "lastSeenAt":  "2026-07-01T12:00:00Z"
+                  },
+                  {
+                      "id":  "user-3",
+                      "fullName":  "Charlie Test",
+                      "email":  "charlie@test.local",
+                      "primaryRole":  "etoile",
+                      "status":  "actif",
+                      "createdAt":  "2026-07-01T12:00:00Z",
+                      "lastSeenAt":  "2026-07-01T12:00:00Z"
+                  }
+              ],
+    "trips":  [
+
+              ],
+    "reports":  [
+
+                ],
+    "pushTokens":  [
+
+                   ],
+    "activity":  [
+
+                 ],
+    "messageConversations":  [
+
+                             ]
+}
