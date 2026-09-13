@@ -984,6 +984,15 @@ function renderUsers(users) {
           cell2.append(phone);
           const cell3 = document.createElement("td");
           cell3.textContent = text(user.primaryRole);
+          if (user.isSuperAdmin) {
+            const superPill = document.createElement("span");
+            superPill.className = "status-pill";
+            superPill.style.backgroundColor = "#6C5CE7";
+            superPill.style.color = "#FFFFFF";
+            superPill.style.marginLeft = "6px";
+            superPill.textContent = "Super Admin";
+            cell3.append(superPill);
+          }
           const cell4 = document.createElement("td");
           const status = document.createElement("span");
           status.className = `status-pill ${user.status === "suspendu" ? "danger" : ""}`;
@@ -1000,7 +1009,19 @@ function renderUsers(users) {
           const button = document.createElement("button");
           button.type = "button";
           button.dataset.toggleUser = user.id;
-          button.textContent = user.status === "suspendu" ? "Reactiver" : "Suspendre";
+          const currentAdminId = text(state.dashboard?.currentAdmin?.id);
+          const isSelf = Boolean(currentAdminId && currentAdminId === user.id);
+          if (isSelf && user.status !== "suspendu") {
+            button.disabled = true;
+            button.title = "Auto-suspension impossible sur votre propre compte";
+            button.textContent = "Votre compte";
+          } else if (user.isSuperAdmin && user.status !== "suspendu") {
+            button.disabled = true;
+            button.title = "Ce super utilisateur ne peut pas être suspendu";
+            button.textContent = "Protégé";
+          } else {
+            button.textContent = user.status === "suspendu" ? "Reactiver" : "Suspendre";
+          }
           cell6.append(button);
           row.append(cell1, cell2, cell3, cell4, cell5, cell6);
           return row;

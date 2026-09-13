@@ -76,6 +76,7 @@ JsonMap publicUserFromState(
     'nameChangedAt': PiwibusStore._nullableText(user['nameChangedAt']),
     'primaryRole': PiwibusStore._text(user['primaryRole']),
     'status': PiwibusStore._text(user['status']),
+    'isSuperAdmin': PiwibusStore._isSuperAdminUser(user),
     'isOnline': isOnline,
     'createdAt': PiwibusStore._text(user['createdAt']),
     'lastSeenAt': latestLastSeenAt == null
@@ -3770,16 +3771,37 @@ class PiwibusStore {
 
   Future<JsonMap> toggleUserStatus(String sessionId, String userId) async {
     _requireAdmin(sessionId);
+    final session = _session(sessionId);
+    final currentAdmin = _currentUser(session);
+    final currentAdminId = _text(currentAdmin?['id']);
+
     final users = _users();
-    for (final user in users) {
-      if (_text(user['id']) == userId) {
-        user['status'] = _text(user['status']) == 'actif'
-            ? 'suspendu'
-            : 'actif';
-        user['lastSeenAt'] = _nowIso();
-        break;
-      }
+    final targetIndex = users.indexWhere((u) => _text(u['id']) == userId);
+    if (targetIndex < 0) {
+      throw StateError('Utilisateur introuvable.');
     }
+
+    final targetUser = users[targetIndex];
+    final currentStatus = _text(targetUser['status']);
+
+    // 1. Anti-auto-suspension : un administrateur ne peut pas suspendre son propre compte
+    if (currentAdminId.isNotEmpty && currentAdminId == userId && currentStatus == 'actif') {
+      throw StateError(
+        'Auto-suspension interdite : un administrateur ne peut pas suspendre son propre compte.',
+      );
+    }
+
+    // 2. Anti-suspension du super utilisateur : un compte super utilisateur ne peut pas être suspendu
+    if (_isSuperAdminUser(targetUser) && currentStatus == 'actif') {
+      throw StateError(
+        'Ce super utilisateur administrateur ne peut pas être suspendu.',
+      );
+    }
+
+    targetUser['status'] = currentStatus == 'actif'
+        ? 'suspendu'
+        : 'actif';
+    targetUser['lastSeenAt'] = _nowIso();
     _state['users'] = users;
     addActivity(
       title: 'Compte modulé',
@@ -3845,6 +3867,7 @@ class PiwibusStore {
       phone: phone,
       role: 'administrateur',
       status: 'actif',
+      isSuperAdmin: true,
       passwordHash: _hashPassword(email, password),
       createdAt: nowIso,
       lastSeenAt: nowIso,
@@ -3871,6 +3894,7 @@ class PiwibusStore {
     final phone = _text(admin['phone']);
     existing['primaryRole'] = 'administrateur';
     existing['status'] = 'actif';
+    existing['isSuperAdmin'] = true;
     existing['passwordHash'] = _text(admin['passwordHash']);
     if (fullName.isNotEmpty) existing['fullName'] = fullName;
     if (phone.isNotEmpty) existing['phone'] = phone;
@@ -3925,6 +3949,7 @@ class PiwibusStore {
     String? nameChangedAt,
     required String role,
     required String status,
+    bool isSuperAdmin = false,
     required String passwordHash,
     required String createdAt,
     required String lastSeenAt,
@@ -3942,6 +3967,7 @@ class PiwibusStore {
       if (nameChangedAt != null) 'nameChangedAt': nameChangedAt,
       'primaryRole': role,
       'status': status,
+      'isSuperAdmin': isSuperAdmin || role == 'administrateur',
       'createdAt': createdAt,
       'lastSeenAt': lastSeenAt,
       'passwordHash': passwordHash,
@@ -4830,6 +4856,7 @@ class PiwibusStore {
       ),
       'primaryRole': _normalizeRole(input['primaryRole']?.toString()),
       'status': _normalizeUserStatus(input['status']?.toString()),
+      'isSuperAdmin': _isSuperAdminUser(input),
       'createdAt': _dateValue(input['createdAt']),
       'lastSeenAt': input['lastSeenAt'] == null
           ? null
@@ -6067,6 +6094,25 @@ class PiwibusStore {
     final map = Map<String, dynamic>.from(user);
     return _normalizeRole(map['primaryRole']?.toString()) == 'administrateur' &&
         _normalizeUserStatus(map['status']?.toString()) == 'actif';
+  }
+
+  static bool _isSuperAdminUser(Object? candidate) {
+    if (candidate is! Map) return false;
+    final map = Map<String, dynamic>.from(candidate);
+    if (map['isSuperAdmin'] == true) return true;
+    final role = _normalizeRole(map['primaryRole']?.toString());
+    if (role == 'administrateur') {
+      return true;
+    }
+    final email = _text(map['email']).trim().toLowerCase();
+    final envAdmin = (Platform.environment['PIWIBUS_ADMIN_EMAIL'] ?? '')
+        .trim()
+        .toLowerCase();
+    if (envAdmin.isNotEmpty && email == envAdmin) return true;
+    if (email == 'admin@piwibus.ci' || email == 'dedivoss247@gmail.com') {
+      return true;
+    }
+    return false;
   }
 
   void addActivity({

@@ -1027,8 +1027,20 @@ function renderUsers(users) {
         createElement("strong", { textContent: text(user.email, "") }),
         createElement("br"),
         createElement("small", { textContent: text(user.phone, "") }),
+      createCellWithContent([
+        document.createTextNode(text(user.primaryRole, "")),
+        ...(user.isSuperAdmin
+          ? [
+              createElement("span", {
+                className: "status-pill",
+                attributes: {
+                  style: "background-color: #6C5CE7; color: #FFFFFF; margin-left: 6px;",
+                },
+                textContent: "Super Admin",
+              }),
+            ]
+          : []),
       ], ""),
-      createElement("td", { textContent: text(user.primaryRole, "") }),
       createCellWithContent([
         createElement("span", { className: `status-pill ${user.status === "suspendu" ? "danger" : ""}`.trim(), textContent: text(user.status, "") }),
       ], ""),
@@ -1040,14 +1052,32 @@ function renderUsers(users) {
       createElement("td", { className: "row-actions" }),
     );
     const actionsCell = row.lastElementChild;
+    const currentAdminId = text(state.dashboard?.currentAdmin?.id, "");
+    const isSelf = Boolean(currentAdminId && currentAdminId === user.id);
+    const isProtected = Boolean(user.isSuperAdmin && user.status !== "suspendu");
+    const isSelfActive = Boolean(isSelf && user.status !== "suspendu");
+    const buttonAttributes = {
+      type: "button",
+      "data-toggle-user": user.id,
+    };
+    if (isSelfActive) {
+      buttonAttributes.disabled = "true";
+      buttonAttributes.title = "Auto-suspension impossible sur votre propre compte";
+    } else if (isProtected) {
+      buttonAttributes.disabled = "true";
+      buttonAttributes.title = "Ce super utilisateur ne peut pas être suspendu";
+    }
     appendChildren(
       actionsCell,
       createElement("button", {
-        attributes: {
-          type: "button",
-          "data-toggle-user": user.id,
-        },
-        textContent: user.status === "suspendu" ? "Reactiver" : "Suspendre",
+        attributes: buttonAttributes,
+        textContent: isSelfActive
+          ? "Votre compte"
+          : isProtected
+          ? "Protégé"
+          : user.status === "suspendu"
+          ? "Reactiver"
+          : "Suspendre",
       }),
     );
     return row;
