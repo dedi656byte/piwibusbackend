@@ -31,7 +31,7 @@ const int _maxJsonBodyBytes = 64 * 1024;
 const String _adminSessionCookieName = 'piwibus_admin_token';
 const String _webSocketProtocolName = 'piwibus.realtime';
 const String _webSocketAuthProtocolPrefix = 'piwibus.auth.';
-const String _adminAssetVersion = '20260625-live-timeout-v1';
+const String _adminAssetVersion = '20260913-v2';
 const String _openStreetMapTileHost = 'https://tile.openstreetmap.org';
 const String _contentSecurityPolicy =
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -58,7 +58,9 @@ Future<void> main(List<String> args) async {
   final passwordResetEmail = PasswordResetEmailService.fromEnvironment(
     logger: logger,
   );
-  if (productionConfig.isProduction && !passwordResetEmail.enabled) {
+  if (productionConfig.isProduction &&
+      !productionConfig.allowDevDefaults &&
+      !passwordResetEmail.enabled) {
     throw StateError(
       'Configuration SMTP requise en production pour le mot de passe oublie '
       '(PIWIBUS_SMTP_HOST, PIWIBUS_SMTP_USERNAME, PIWIBUS_SMTP_PASSWORD, '

@@ -1027,6 +1027,7 @@ function renderUsers(users) {
         createElement("strong", { textContent: text(user.email, "") }),
         createElement("br"),
         createElement("small", { textContent: text(user.phone, "") }),
+      ]),
       createCellWithContent([
         document.createTextNode(text(user.primaryRole, "")),
         ...(user.isSuperAdmin
