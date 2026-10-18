@@ -1003,6 +1003,7 @@ tr:hover td      { background: rgba(255,255,255,.02); }
 }
 
 .map-live-item > span { grid-row: span 2; }
+.map-live-trip-item > span { grid-row: span 3; }
 
 .map-live-item strong,
 .map-live-item small,
@@ -1014,6 +1015,13 @@ tr:hover td      { background: rgba(255,255,255,.02); }
 
 .map-live-item small,
 .map-legend-item small { color: var(--muted); font-size: 11px; }
+
+.map-live-trip-item .map-live-trip-name {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
 
 .map-legend-item {
   display: grid;

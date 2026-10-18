@@ -1,8 +1,17 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:postgres/postgres.dart';
+
+class ConcurrentStateMutationException implements Exception {
+  const ConcurrentStateMutationException();
+
+  static const String code = 'concurrent_state_mutation';
+  static const String message =
+      'Les données ont changé sur le serveur. Actualisez puis réessayez.';
+}
 
 class StateMutationBatch {
   const StateMutationBatch({
@@ -43,6 +52,8 @@ abstract class StatePersistence {
   Future<void> saveState(Map<String, dynamic> state);
 
   Future<void> checkReady() async {}
+
+  Future<bool> hasExternalChanges() async => false;
 
   Future<void> applyMutations({
     required Map<String, dynamic> state,
@@ -114,17 +125,14 @@ class JsonFileStatePersistence extends StatePersistence {
 
 class PostgresStatePersistence extends StatePersistence {
   PostgresStatePersistence._({
-    required String databaseUrl,
-    required Connection connection,
+    required Pool<dynamic> connection,
     required bool postgisAvailable,
-  }) : _databaseUrl = databaseUrl,
-       _connection = connection,
+  }) : _connection = connection,
        _postgisAvailable = postgisAvailable;
 
-  final String _databaseUrl;
-  Connection _connection;
-  bool _postgisAvailable;
-  Future<void>? _reconnectInFlight;
+  final Pool<dynamic> _connection;
+  final bool _postgisAvailable;
+  Future<void> _transactionOperations = Future<void>.value();
   bool _closed = false;
 
   final Map<String, String> _lastSessionFingerprints = <String, String>{};
@@ -138,8 +146,10 @@ class PostgresStatePersistence extends StatePersistence {
   final Map<String, String> _lastPushTokenFingerprints = <String, String>{};
   String? _lastActivityFingerprint;
   String? _lastTripLocationsFingerprint;
+  int _loadedRevision = 0;
 
   static const String _stateId = 'default';
+  static const int _defaultMaxConnectionCount = 10;
 
   @override
   String get name =>
@@ -162,13 +172,21 @@ class PostgresStatePersistence extends StatePersistence {
     });
   }
 
+  @override
+  Future<bool> hasExternalChanges() async {
+    final revision = await _withConnectionRetry(_readRevisionOn);
+    return revision != _loadedRevision;
+  }
+
   static Future<PostgresStatePersistence> open(String databaseUrl) async {
-    final normalizedDatabaseUrl = _withDefaultSslMode(databaseUrl);
-    final connection = await Connection.openFromUrl(normalizedDatabaseUrl);
-    final postgisAvailable = await _tryEnablePostgis(connection);
-    await _ensureSchema(connection, postgisAvailable: postgisAvailable);
+    final normalizedDatabaseUrl = _withDefaultPoolSettings(databaseUrl);
+    final connection = Pool<dynamic>.withUrl(normalizedDatabaseUrl);
+    final postgisAvailable = await connection.withConnection((session) async {
+      final available = await _tryEnablePostgis(session);
+      await _ensureSchema(session, postgisAvailable: available);
+      return available;
+    });
     final persistence = PostgresStatePersistence._(
-      databaseUrl: normalizedDatabaseUrl,
       connection: connection,
       postgisAvailable: postgisAvailable,
     );
@@ -179,6 +197,7 @@ class PostgresStatePersistence extends StatePersistence {
   @override
   Future<Map<String, dynamic>?> loadState() {
     return _withConnectionRetry((connection) async {
+      _loadedRevision = await _readRevisionOn(connection);
       final hasState = await _hasNormalizedStateOn(connection);
       if (!hasState) return null;
 
@@ -416,7 +435,8 @@ class PostgresStatePersistence extends StatePersistence {
       SELECT
         id, sort_order, kind, participant_ids, trip_id, title, subtitle,
         last_message_preview, last_message_id, last_sender_id, message_cursor,
-        read_sequences, created_at, updated_at
+        read_sequences, read_receipt_sequences, delivered_sequences,
+        created_at, updated_at
       FROM piwibus_message_conversations
       ORDER BY sort_order ASC, updated_at DESC, id ASC
     ''');
@@ -437,6 +457,12 @@ class PostgresStatePersistence extends StatePersistence {
               'messageCursor': _int(map['message_cursor']),
               'readSequences':
                   _jsonMapOrNull(map['read_sequences']) ??
+                  const <String, dynamic>{},
+              'readReceiptSequences':
+                  _jsonMapOrNull(map['read_receipt_sequences']) ??
+                  const <String, dynamic>{},
+              'deliveredSequences':
+                  _jsonMapOrNull(map['delivered_sequences']) ??
                   const <String, dynamic>{},
               'createdAt': _iso(map['created_at']),
               'updatedAt': _iso(map['updated_at']),
@@ -475,9 +501,8 @@ class PostgresStatePersistence extends StatePersistence {
         _mapList(state['messageConversations']),
       );
       await _syncTripLocations(session, state);
-      await _bumpRevisionAndNotify(session);
-    });
-    _refreshFingerprintsFromState(state);
+      return _bumpRevisionAndNotify(session, expectedRevision: _loadedRevision);
+    }, onSuccess: () => _refreshFingerprintsFromState(state));
   }
 
   @override
@@ -512,9 +537,8 @@ class PostgresStatePersistence extends StatePersistence {
           _mapList(state['messageConversations']),
         );
       }
-      await _bumpRevisionAndNotify(session);
-    });
-    _refreshFingerprintsFromState(state, batch: batch);
+      return _bumpRevisionAndNotify(session, expectedRevision: _loadedRevision);
+    }, onSuccess: () => _refreshFingerprintsFromState(state, batch: batch));
   }
 
   @override
@@ -597,14 +621,6 @@ class PostgresStatePersistence extends StatePersistence {
   @override
   Future<void> close() async {
     _closed = true;
-    final reconnecting = _reconnectInFlight;
-    if (reconnecting != null) {
-      try {
-        await reconnecting;
-      } catch (_) {
-        // Closing should remain best-effort even if a reconnect just failed.
-      }
-    }
     try {
       await _connection.close(force: true);
     } catch (_) {
@@ -637,6 +653,15 @@ class PostgresStatePersistence extends StatePersistence {
     return result.isNotEmpty && result.first[0] == true;
   }
 
+  Future<int> _readRevisionOn(Connection connection) async {
+    final result = await connection.execute(
+      Sql.named('SELECT revision FROM piwibus_meta WHERE id = @id'),
+      parameters: const <String, Object?>{'id': _stateId},
+    );
+    if (result.isEmpty) return 0;
+    return int.tryParse(result.first[0].toString()) ?? 0;
+  }
+
   Future<Map<String, dynamic>?> _loadLegacyState() {
     return _withConnectionRetry(_loadLegacyStateOn);
   }
@@ -655,72 +680,40 @@ class PostgresStatePersistence extends StatePersistence {
   Future<T> _withConnectionRetry<T>(
     Future<T> Function(Connection connection) action,
   ) async {
+    if (_closed) {
+      throw StateError('Postgres persistence is closed.');
+    }
     try {
-      return await action(await _connectionOrReconnect());
+      return await _connection.withConnection(action);
     } catch (error) {
       if (!_isClosedConnectionError(error)) rethrow;
-      await _reconnect();
-      return action(await _connectionOrReconnect());
+      return await _connection.withConnection(action);
     }
   }
 
-  Future<T> _withTransactionRetry<T>(
-    Future<T> Function(TxSession session) action,
-  ) {
-    return _withConnectionRetry((connection) => connection.runTx(action));
-  }
-
-  Future<Connection> _connectionOrReconnect() async {
+  Future<int> _withTransactionRetry(
+    Future<int> Function(TxSession session) action, {
+    required void Function() onSuccess,
+  }) {
     if (_closed) {
-      throw StateError('Postgres persistence is closed.');
+      return Future<int>.error(StateError('Postgres persistence is closed.'));
     }
-    if (_connection.isOpen) return _connection;
-    await _reconnect();
-    return _connection;
-  }
-
-  Future<void> _reconnect() {
-    if (_closed) {
-      throw StateError('Postgres persistence is closed.');
-    }
-    final reconnecting = _reconnectInFlight;
-    if (reconnecting != null) return reconnecting;
-
-    final previous = _connection;
-    late final Future<void> nextReconnect;
-    nextReconnect = () async {
-      Connection? next;
+    final previousOperation = _transactionOperations;
+    final operationFinished = Completer<void>();
+    _transactionOperations = operationFinished.future;
+    return () async {
+      await previousOperation;
       try {
-        next = await Connection.openFromUrl(_databaseUrl);
-        final postgisAvailable = await _tryEnablePostgis(next);
-        await _ensureSchema(next, postgisAvailable: postgisAvailable);
-        if (_closed) {
-          await next.close(force: true);
-          throw StateError('Postgres persistence is closed.');
-        }
-        _postgisAvailable = postgisAvailable;
-        _connection = next;
-        try {
-          await previous.close(force: true);
-        } catch (_) {
-          // The previous connection may already have been closed by the server.
-        }
-      } catch (_) {
-        if (next != null && next.isOpen) {
-          try {
-            await next.close(force: true);
-          } catch (_) {}
-        }
-        rethrow;
+        final revision = await _withConnectionRetry(
+          (connection) => connection.runTx(action),
+        );
+        _loadedRevision = revision;
+        onSuccess();
+        return revision;
       } finally {
-        if (identical(_reconnectInFlight, nextReconnect)) {
-          _reconnectInFlight = null;
-        }
+        operationFinished.complete();
       }
     }();
-
-    _reconnectInFlight = nextReconnect;
-    return nextReconnect;
   }
 
   static bool _isClosedConnectionError(Object error) {
@@ -1100,12 +1093,16 @@ class PostgresStatePersistence extends StatePersistence {
             INSERT INTO piwibus_message_conversations (
               id, sort_order, kind, participant_ids, trip_id, title, subtitle,
               last_message_preview, last_message_id, last_sender_id,
-              message_cursor, read_sequences, created_at, updated_at
+              message_cursor, read_sequences, read_receipt_sequences,
+              delivered_sequences,
+              created_at, updated_at
             )
             VALUES (
               @id, @sort_order, @kind, @participant_ids, @trip_id, @title,
               @subtitle, @last_message_preview, @last_message_id,
               @last_sender_id, @message_cursor, @read_sequences::jsonb,
+              @read_receipt_sequences::jsonb,
+              @delivered_sequences::jsonb,
               @created_at, @updated_at
             )
             ON CONFLICT (id) DO UPDATE SET
@@ -1120,6 +1117,8 @@ class PostgresStatePersistence extends StatePersistence {
               last_sender_id = EXCLUDED.last_sender_id,
               message_cursor = EXCLUDED.message_cursor,
               read_sequences = EXCLUDED.read_sequences,
+              read_receipt_sequences = EXCLUDED.read_receipt_sequences,
+              delivered_sequences = EXCLUDED.delivered_sequences,
               created_at = EXCLUDED.created_at,
               updated_at = EXCLUDED.updated_at
           '''),
@@ -1136,6 +1135,12 @@ class PostgresStatePersistence extends StatePersistence {
             'last_sender_id': _nullableText(row['lastSenderId']),
             'message_cursor': _int(row['messageCursor']),
             'read_sequences': jsonEncode(row['readSequences'] ?? const {}),
+            'read_receipt_sequences': jsonEncode(
+              row['readReceiptSequences'] ?? const {},
+            ),
+            'delivered_sequences': jsonEncode(
+              row['deliveredSequences'] ?? const {},
+            ),
             'created_at': _dateTime(row['createdAt']),
             'updated_at': _dateTime(row['updatedAt']),
           },
@@ -1358,18 +1363,26 @@ class PostgresStatePersistence extends StatePersistence {
     }
   }
 
-  Future<void> _bumpRevisionAndNotify(TxSession session) async {
-    await session.execute(
+  Future<int> _bumpRevisionAndNotify(
+    TxSession session, {
+    required int expectedRevision,
+  }) async {
+    final result = await session.execute(
       Sql.named('''
-        INSERT INTO piwibus_meta (id, revision, updated_at)
-        VALUES (@id, 1, now())
-        ON CONFLICT (id) DO UPDATE SET
-          revision = piwibus_meta.revision + 1,
+        UPDATE piwibus_meta
+        SET revision = revision + 1,
           updated_at = now()
+        WHERE id = @id AND revision = @expectedRevision
+        RETURNING revision
       '''),
-      parameters: const <String, Object?>{'id': _stateId},
-      ignoreRows: true,
+      parameters: <String, Object?>{
+        'id': _stateId,
+        'expectedRevision': expectedRevision,
+      },
     );
+    if (result.isEmpty) {
+      throw const ConcurrentStateMutationException();
+    }
     await session.execute(
       Sql.named("SELECT pg_notify('piwibus_state_changed', @payload)"),
       parameters: <String, Object?>{
@@ -1377,6 +1390,7 @@ class PostgresStatePersistence extends StatePersistence {
       },
       ignoreRows: true,
     );
+    return int.tryParse(result.first[0].toString()) ?? expectedRevision + 1;
   }
 
   Future<void> _syncKeyedCollection({
@@ -1630,17 +1644,23 @@ class PostgresStatePersistence extends StatePersistence {
       });
   }
 
-  static String _withDefaultSslMode(String databaseUrl) {
+  static String _withDefaultPoolSettings(String databaseUrl) {
     final uri = Uri.parse(databaseUrl);
-    final hasSslMode = uri.queryParameters.keys.any(
+    final queryParameters = uri.queryParameters;
+    final hasSslMode = queryParameters.keys.any(
       (key) => key.toLowerCase() == 'sslmode',
     );
-    if (hasSslMode) return databaseUrl;
+    final hasMaxConnectionCount = queryParameters.containsKey(
+      'max_connection_count',
+    );
+    if (hasSslMode && hasMaxConnectionCount) return databaseUrl;
     return uri
         .replace(
           queryParameters: <String, String>{
-            ...uri.queryParameters,
-            'sslmode': 'disable',
+            ...queryParameters,
+            if (!hasSslMode) 'sslmode': 'disable',
+            if (!hasMaxConnectionCount)
+              'max_connection_count': '$_defaultMaxConnectionCount',
           },
         )
         .toString();
@@ -1724,6 +1744,11 @@ class PostgresStatePersistence extends StatePersistence {
           revision bigint NOT NULL DEFAULT 0,
           updated_at timestamptz NOT NULL DEFAULT now()
         )
+        ''',
+        '''
+        INSERT INTO piwibus_meta (id, revision)
+        VALUES ('default', 0)
+        ON CONFLICT (id) DO NOTHING
         ''',
         '''
         CREATE TABLE IF NOT EXISTS piwibus_users (
@@ -2385,6 +2410,28 @@ class PostgresStatePersistence extends StatePersistence {
         '''
         ALTER TABLE piwibus_users
         DROP COLUMN IF EXISTS messaging_public_key
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 18,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_message_conversations
+        ADD COLUMN IF NOT EXISTS delivered_sequences jsonb
+        NOT NULL DEFAULT '{}'::jsonb
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 19,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_message_conversations
+        ADD COLUMN IF NOT EXISTS read_receipt_sequences jsonb
+        NOT NULL DEFAULT '{}'::jsonb
         ''',
       ],
     );

@@ -19,6 +19,7 @@ import '../lib/src/production_config.dart';
 import '../lib/src/push_notifications.dart';
 import '../lib/src/rate_limiter.dart';
 import '../lib/src/redis_realtime.dart';
+import '../lib/src/state_persistence.dart';
 import '../lib/src/store.dart';
 
 const String _backendBuildLabel = '2026-06-25-live-timeout-v1';
@@ -58,9 +59,7 @@ Future<void> main(List<String> args) async {
   final passwordResetEmail = PasswordResetEmailService.fromEnvironment(
     logger: logger,
   );
-  if (productionConfig.isProduction &&
-      !productionConfig.allowDevDefaults &&
-      !passwordResetEmail.enabled) {
+  if (productionConfig.isProduction && !passwordResetEmail.enabled) {
     throw StateError(
       'Configuration SMTP requise en production pour le mot de passe oublie '
       '(PIWIBUS_SMTP_HOST, PIWIBUS_SMTP_USERNAME, PIWIBUS_SMTP_PASSWORD, '
@@ -204,6 +203,7 @@ Future<void> main(List<String> args) async {
   router.get('/ready', (Request request) async {
     try {
       await store.checkReady();
+      await redis?.checkReady();
       return _json(
         _readinessPayload(
           store: store,
@@ -247,7 +247,7 @@ Future<void> main(List<String> args) async {
         'dashboard': adminDashboardFor(sessionId),
       }, headers: _adminSessionCookieHeaders(request, token));
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.post('/admin/auth/logout', (Request request) async {
@@ -259,10 +259,7 @@ Future<void> main(List<String> args) async {
         'ok': true,
       }, headers: _clearAdminSessionCookieHeaders(request));
     } catch (error) {
-      return _error(
-        error is StateError ? error.message : error.toString(),
-        statusCode: 401,
-      );
+      return _errorForException(error, fallbackStatusCode: 401);
     }
   });
   router.get('/admin/dashboard', (Request request) async {
@@ -276,10 +273,7 @@ Future<void> main(List<String> args) async {
         ),
       );
     } catch (error) {
-      return _error(
-        error is StateError ? error.message : error.toString(),
-        statusCode: 401,
-      );
+      return _errorForException(error, fallbackStatusCode: 401);
     }
   });
   router.get('/admin/map-data', (Request request) async {
@@ -287,10 +281,7 @@ Future<void> main(List<String> args) async {
       final sessionId = await adminSessionIdFor(request);
       return _json(store.adminMapData(sessionId));
     } catch (error) {
-      return _error(
-        error is StateError ? error.message : error.toString(),
-        statusCode: 401,
-      );
+      return _errorForException(error, fallbackStatusCode: 401);
     }
   });
   router.get('/admin/map-tiles/<z|[0-9]+>/<x|[0-9]+>/<y|[0-9]+>.png', (
@@ -303,6 +294,9 @@ Future<void> main(List<String> args) async {
       await adminSessionIdFor(request);
       return await _proxyOpenStreetMapTile(mapTileClient, z: z, x: x, y: y);
     } catch (error) {
+      if (error is ConcurrentStateMutationException) {
+        return _errorForException(error);
+      }
       return _text(
         error is StateError ? error.message : error.toString(),
         statusCode: error is StateError ? 400 : 502,
@@ -318,10 +312,7 @@ Future<void> main(List<String> args) async {
         headers: _eventStreamHeaders(),
       );
     } catch (error) {
-      return _error(
-        error is StateError ? error.message : error.toString(),
-        statusCode: 401,
-      );
+      return _errorForException(error, fallbackStatusCode: 401);
     }
   });
   router.get('/admin/ws', (Request request) async {
@@ -337,10 +328,7 @@ Future<void> main(List<String> args) async {
     } on HijackException {
       rethrow;
     } catch (error) {
-      return _error(
-        error is StateError ? error.message : error.toString(),
-        statusCode: 401,
-      );
+      return _errorForException(error, fallbackStatusCode: 401);
     }
   });
   router.post('/admin/trips/<id>/stop', (Request request, String id) async {
@@ -374,7 +362,7 @@ Future<void> main(List<String> args) async {
       }
       return _json(adminDashboardFor(sessionId));
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.patch('/admin/users/<id>/status', (Request request, String id) async {
@@ -384,7 +372,7 @@ Future<void> main(List<String> args) async {
       await store.toggleUserStatus(sessionId, id);
       return _json(adminDashboardFor(sessionId));
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.patch('/admin/reports/<id>/status', (
@@ -402,7 +390,7 @@ Future<void> main(List<String> args) async {
       );
       return _json(adminDashboardFor(sessionId));
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.delete('/admin/reports/<id>', (Request request, String id) async {
@@ -412,7 +400,7 @@ Future<void> main(List<String> args) async {
       await store.deleteReport(sessionId, id);
       return _json(adminDashboardFor(sessionId));
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.post('/admin/notifications', (Request request) async {
@@ -472,7 +460,7 @@ Future<void> main(List<String> args) async {
         },
       });
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.get('/snapshot', (Request request) async {
@@ -595,7 +583,7 @@ Future<void> main(List<String> args) async {
         ),
       });
     } catch (error) {
-      return _error(error.toString());
+      return _errorForException(error);
     }
   });
   router.get('/trips/<id>/status', (Request request, String id) async {
@@ -641,7 +629,7 @@ Future<void> main(List<String> args) async {
         ),
       );
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   }
 
@@ -664,9 +652,11 @@ Future<void> main(List<String> args) async {
   router.post('/auth/reset-password/confirm', handlePasswordResetConfirm);
   router.post('/auth/logout', (Request request) async {
     final sessionId = await sessionIdFor(request);
-    final snapshot = await store.logout(sessionId);
-    sendTripCancellationNoticesFromSnapshot(snapshot);
-    return _json(_snapshotForRequest(request, snapshot, jwtCodec));
+    return _handleJson(request, jwtCodec, (_) async {
+      final snapshot = await store.logout(sessionId);
+      sendTripCancellationNoticesFromSnapshot(snapshot);
+      return snapshot;
+    });
   });
   // Marque toutes les activités comme lues pour l'utilisateur connecté.
   // Persiste en base de données — survit à la désinstallation de l'app.
@@ -690,7 +680,7 @@ Future<void> main(List<String> args) async {
         'activityReadAt': activityReadAt,
       });
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   // Marque une alerte spécifique comme lue pour l'utilisateur connecté.
@@ -704,7 +694,7 @@ Future<void> main(List<String> args) async {
       await store.markAlertRead(sessionId, reportId);
       return _json(<String, dynamic>{'ok': true});
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
   router.post('/session/role', (Request request) async {
@@ -862,31 +852,41 @@ Future<void> main(List<String> args) async {
         );
         // Si une photo est demandee (opt-in, desactive par defaut), on la
         // sert via l'URL cacheable plutot que le base64 brut.
-        final servedItems = items.map((item) {
-          final user = item['user'];
-          if (user is! Map) return item;
-          return <String, dynamic>{
-            ...item,
-            'user': _withServedUserPhoto(request, user),
-          };
-        }).toList(growable: false);
+        final servedItems = items
+            .map((item) {
+              final user = item['user'];
+              if (user is! Map) return item;
+              return <String, dynamic>{
+                ...item,
+                'user': _withServedUserPhoto(request, user),
+              };
+            })
+            .toList(growable: false);
         return _json(<String, dynamic>{'items': servedItems});
       } on StateError {
         return _json(<String, dynamic>{'items': <Object>[]});
       }
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
 
   router.get('/messages/conversations', (Request request) async {
     try {
       final sessionId = await sessionIdFor(request);
+      final conversations = store.messageConversationsForSession(sessionId);
       return _json(<String, dynamic>{
-        'items': store.messageConversationsForSession(sessionId),
+        'items': conversations
+            .map(
+              (conversation) => _withServedMessageConversationPeerPhoto(
+                request,
+                conversation,
+              ),
+            )
+            .toList(growable: false),
       });
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
 
@@ -927,7 +927,7 @@ Future<void> main(List<String> args) async {
         ),
       });
     } catch (error) {
-      return _error(error is StateError ? error.message : error.toString());
+      return _errorForException(error);
     }
   });
 
@@ -981,6 +981,9 @@ Future<void> main(List<String> args) async {
       }
       return _json(_snapshotForRequest(request, result, jwtCodec));
     } catch (error) {
+      if (error is ConcurrentStateMutationException) {
+        return _errorForException(error);
+      }
       if (error is StateError) {
         return _error(error.message);
       }
@@ -1003,6 +1006,18 @@ Future<void> main(List<String> args) async {
     );
   });
 
+  router.patch('/messages/conversations/<id>/delivered', (
+    Request request,
+    String id,
+  ) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(
+      request,
+      jwtCodec,
+      (body) => store.markMessageConversationDelivered(sessionId, id, body),
+    );
+  });
+
   router.post('/trips', (Request request) async {
     final sessionId = await sessionIdFor(request);
     return _handleJson(request, jwtCodec, (body) async {
@@ -1015,7 +1030,7 @@ Future<void> main(List<String> args) async {
           title: 'Nouveau bus sur la ligne',
           subtitle: 'Un nouveau bus vient d’apparaître sur la ligne $lineCode.',
           iconKey: 'bus',
-          colorValue: 0xFF0F8B8D,
+          colorValue: 0xFF0F766E,
           audienceSessionIds: audience.sessionIds,
         );
       }
@@ -1188,6 +1203,7 @@ Future<void> main(List<String> args) async {
   });
 
   final handler = Pipeline()
+      .addMiddleware(_concurrentStateMutationMiddleware())
       .addMiddleware(_corsMiddleware(corsOrigin))
       .addMiddleware(metrics.middleware())
       .addMiddleware(_requestLogMiddleware(logger))
@@ -1199,7 +1215,7 @@ Future<void> main(List<String> args) async {
   logger.info('Piwibus backend running', <String, Object?>{
     'url': 'http://${server.address.host}:${server.port}',
     'storage': store.storageBackend,
-    'redisRealtime': redis != null,
+    'redisRealtime': redis?.isSubscriptionReady ?? false,
     'pushNotifications': pushNotifications.enabled,
     'staleTripTimeoutSeconds': staleTripTimeout.inSeconds,
     'staleTripSweepSeconds': staleTripSweepInterval.inSeconds,
@@ -1240,6 +1256,9 @@ Future<Response> _handleJson(
     final body = await _readJson(request);
     return _json(_snapshotForRequest(request, await action(body), jwtCodec));
   } catch (error) {
+    if (error is ConcurrentStateMutationException) {
+      return _errorForException(error);
+    }
     if (error is StateError) {
       return _error(error.message);
     }
@@ -1296,7 +1315,7 @@ JsonMap _readinessPayload({
     'databaseBacked': store.isDatabaseBacked,
     'geospatialQueries': store.supportsGeospatialQueries,
     'environment': productionConfig.environment,
-    'redisRealtime': redis != null,
+    'redisRealtime': redis?.isSubscriptionReady ?? false,
     'pushNotifications': pushNotifications.enabled,
     'build': _backendBuildLabel,
     'adminAssetVersion': _adminAssetVersion,
@@ -1329,6 +1348,18 @@ Middleware _storageReadinessMiddleware(PiwibusStore store) {
         );
       }
       return innerHandler(request);
+    };
+  };
+}
+
+Middleware _concurrentStateMutationMiddleware() {
+  return (Handler innerHandler) {
+    return (Request request) async {
+      try {
+        return await innerHandler(request);
+      } on ConcurrentStateMutationException catch (error) {
+        return _errorForException(error);
+      }
     };
   };
 }
@@ -1390,6 +1421,21 @@ Response _text(String body, {int statusCode = 200}) {
 
 Response _error(String message, {int statusCode = 400}) {
   return _json(<String, dynamic>{'error': message}, statusCode: statusCode);
+}
+
+Response _errorForException(Object error, {int fallbackStatusCode = 400}) {
+  if (error is ConcurrentStateMutationException) {
+    return _json(<String, dynamic>{
+      'error': ConcurrentStateMutationException.message,
+      'code': ConcurrentStateMutationException.code,
+    }, statusCode: 409);
+  }
+  final message = error is StateError
+      ? error.message
+      : error is FormatException
+      ? error.message
+      : error.toString();
+  return _error(message, statusCode: fallbackStatusCode);
 }
 
 Future<Response> _proxyOpenStreetMapTile(
@@ -2243,7 +2289,9 @@ String? _servedPhotoUrlFor(
   final id = _string(userId);
   final dataUrl = _string(photoDataUrl);
   if (id.isEmpty || dataUrl.isEmpty) return null;
-  final scheme = _requestIsSecure(request) ? 'https' : request.requestedUri.scheme;
+  final scheme = _requestIsSecure(request)
+      ? 'https'
+      : request.requestedUri.scheme;
   // shelf_io reconstruit `requestedUri` depuis l'en-tete Host mais en retirant
   // le port (ex: `192.168.5.1:8080` devient `192.168.5.1`), ce qui rend l'URL
   // servie inatteignable derriere un proxy sur un port non standard. On lit
@@ -2302,7 +2350,10 @@ JsonMap _withServedPhotoUrls(Request request, JsonMap snapshot) {
     result['trips'] = trips
         .map(
           (item) => item is Map
-              ? _withServedTripOwnerPhoto(request, Map<String, dynamic>.from(item))
+              ? _withServedTripOwnerPhoto(
+                  request,
+                  Map<String, dynamic>.from(item),
+                )
               : item,
         )
         .toList(growable: false);
@@ -2310,18 +2361,31 @@ JsonMap _withServedPhotoUrls(Request request, JsonMap snapshot) {
 
   final messageConversations = result['messageConversations'];
   if (messageConversations is List) {
-    result['messageConversations'] = messageConversations.map((item) {
-      if (item is! Map) return item;
-      final conversation = Map<String, dynamic>.from(item);
-      final peerUser = conversation['peerUser'];
-      if (peerUser is Map) {
-        conversation['peerUser'] = _withServedUserPhoto(request, peerUser);
-      }
-      return conversation;
-    }).toList(growable: false);
+    result['messageConversations'] = messageConversations
+        .map(
+          (item) => item is Map
+              ? _withServedMessageConversationPeerPhoto(
+                  request,
+                  Map<String, dynamic>.from(item),
+                )
+              : item,
+        )
+        .toList(growable: false);
   }
 
   return result;
+}
+
+JsonMap _withServedMessageConversationPeerPhoto(
+  Request request,
+  JsonMap value,
+) {
+  final conversation = Map<String, dynamic>.from(value);
+  final peerUser = conversation['peerUser'];
+  if (peerUser is Map) {
+    conversation['peerUser'] = _withServedUserPhoto(request, peerUser);
+  }
+  return conversation;
 }
 
 bool _includeLines(Request request, JsonMap snapshot) {

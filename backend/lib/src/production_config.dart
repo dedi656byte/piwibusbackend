@@ -19,29 +19,31 @@ class ProductionConfig {
 
   bool get isProduction => environment == 'production';
 
-  factory ProductionConfig.fromEnvironment() {
+  factory ProductionConfig.fromEnvironment([
+    Map<String, String>? environment,
+  ]) {
+    final env = environment ?? Platform.environment;
     return ProductionConfig._(
-      environment: (Platform.environment['PIWIBUS_ENV'] ?? 'development')
+      environment: (env['PIWIBUS_ENV'] ?? 'development')
           .trim()
           .toLowerCase(),
       databaseUrl:
-          (Platform.environment['PIWIBUS_DATABASE_URL'] ??
-                  Platform.environment['DATABASE_URL'] ??
+          (env['PIWIBUS_DATABASE_URL'] ??
+                  env['DATABASE_URL'] ??
                   '')
               .trim(),
       redisUrl:
-          (Platform.environment['PIWIBUS_REDIS_URL'] ??
-                  Platform.environment['REDIS_URL'] ??
+          (env['PIWIBUS_REDIS_URL'] ??
+                  env['REDIS_URL'] ??
                   '')
               .trim(),
-      corsOrigin: (Platform.environment['PIWIBUS_CORS_ORIGIN'] ?? '*').trim(),
+      corsOrigin: (env['PIWIBUS_CORS_ORIGIN'] ?? '*').trim(),
       jwtSecret:
-          (Platform.environment['PIWIBUS_JWT_SECRET'] ??
-                  Platform.environment['JWT_SECRET'] ??
+          (env['PIWIBUS_JWT_SECRET'] ??
+                  env['JWT_SECRET'] ??
                   '')
               .trim(),
-      allowDevDefaults:
-          (Platform.environment['PIWIBUS_ALLOW_DEV_DEFAULTS'] ?? '')
+      allowDevDefaults: (env['PIWIBUS_ALLOW_DEV_DEFAULTS'] ?? '')
               .trim()
               .toLowerCase() ==
           'true',
@@ -49,9 +51,25 @@ class ProductionConfig {
   }
 
   void validateOrThrow() {
-    if (!isProduction || allowDevDefaults) return;
+    const supportedEnvironments = <String>{
+      'development',
+      'test',
+      'production',
+    };
+    if (!supportedEnvironments.contains(environment)) {
+      throw StateError(
+        'PIWIBUS_ENV invalide. Valeurs acceptees : '
+        '${supportedEnvironments.join(', ')}.',
+      );
+    }
+    if (!isProduction) return;
 
     final failures = <String>[];
+    if (allowDevDefaults) {
+      failures.add(
+        'PIWIBUS_ALLOW_DEV_DEFAULTS ne peut pas etre active en production.',
+      );
+    }
     if (databaseUrl.isEmpty) {
       failures.add('PIWIBUS_DATABASE_URL est requis en production.');
     }

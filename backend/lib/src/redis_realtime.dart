@@ -29,8 +29,21 @@ class RedisRealtime {
   Timer? _reconnectTimer;
   DateTime? _lastRateLimitErrorLogAt;
   bool _closed = false;
+  bool _subscriptionReady = false;
 
   Stream<void> get remoteChanges => _remoteChanges.stream;
+  bool get isSubscriptionReady => _subscriptionReady && !_closed;
+
+  Future<void> checkReady() async {
+    if (_closed) throw StateError('Redis realtime is closed.');
+    final response = await _command.send_object(const ['PING']);
+    if (response?.toString().toUpperCase() != 'PONG') {
+      throw StateError('Redis command connection did not return PONG.');
+    }
+    if (!_subscriptionReady) {
+      throw StateError('Redis realtime subscription is not active.');
+    }
+  }
 
   static Future<RedisRealtime?> openFromEnvironment({
     required OpsLogger logger,
@@ -145,6 +158,7 @@ class RedisRealtime {
 
   Future<void> _connectSubscription() async {
     if (_closed) return;
+    _subscriptionReady = false;
     final connection = RedisConnection();
     try {
       final command = await config.connect(connection);
@@ -182,6 +196,10 @@ class RedisRealtime {
     if (event is! List || event.length < 3) return;
     final kind = event[0]?.toString();
     final channel = event[1]?.toString();
+    if (kind == 'subscribe' && channel == config.channel) {
+      _subscriptionReady = true;
+      return;
+    }
     final payloadText = event[2]?.toString() ?? '';
     if (kind != 'message' || channel != config.channel) return;
     try {
@@ -195,6 +213,7 @@ class RedisRealtime {
 
   void _scheduleReconnect() {
     if (_closed) return;
+    _subscriptionReady = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(seconds: 3), () async {
       await _subscription?.cancel();

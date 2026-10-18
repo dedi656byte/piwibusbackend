@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:piwibus_backend/src/state_persistence.dart';
 import 'package:piwibus_backend/src/store.dart';
@@ -24,19 +26,41 @@ void main() {
         'bootstrap administrator is marked as super admin and cannot be '
         'suspended or self-suspended', () async {
       final stateFile = File(p.join(tempDir.path, 'state.json'));
+      const adminEmail = 'fixture.admin@example.com';
+      const adminPassword = 'fixture-password-123';
+      final passwordHash = sha256
+          .convert(utf8.encode('$adminEmail::$adminPassword'))
+          .toString();
+      await stateFile.writeAsString(
+        jsonEncode(<String, dynamic>{
+          'sessions': <String, dynamic>{},
+          'users': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'id': 'admin-fixture',
+              'fullName': 'Fixture Administrator',
+              'email': adminEmail,
+              'phone': '',
+              'primaryRole': 'administrateur',
+              'status': 'actif',
+              'isSuperAdmin': true,
+              'createdAt': '2026-01-01T00:00:00.000Z',
+              'lastSeenAt': '2026-01-01T00:00:00.000Z',
+              'passwordHash': passwordHash,
+              'readAlertIds': <String>[],
+              'starTripIds': <String>[],
+              'followedTripIds': <String>[],
+            },
+          ],
+          'trips': <dynamic>[],
+          'reports': <dynamic>[],
+          'pushTokens': <dynamic>[],
+          'activity': <dynamic>[],
+        }),
+      );
       final store = await PiwibusStore.openWithPersistence(
         JsonFileStatePersistence(stateFile),
       );
 
-      // The bootstrap admin is seeded automatically from env vars on store
-      // creation. Always sign in with those credentials — never register.
-      final adminEmail =
-          (Platform.environment['PIWIBUS_ADMIN_EMAIL'] ?? 'dedivoss247@gmail.com')
-              .toLowerCase();
-      final adminPassword =
-          Platform.environment['PIWIBUS_ADMIN_PASSWORD'] ?? 'Dedi@76201234567';
-
-      // Sign in as the bootstrap admin (already seeded by the store).
       await store.signIn('admin-session', <String, dynamic>{
         'email': adminEmail,
         'password': adminPassword,
@@ -137,4 +161,3 @@ void main() {
     });
   });
 }
-

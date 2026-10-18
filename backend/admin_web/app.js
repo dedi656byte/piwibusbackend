@@ -888,7 +888,13 @@ function renderTrips(trips) {
         "",
       ),
       createCellWithContent(
-        [createElement("strong", { textContent: text(trip.ownerName, "") }), createElement("br"), createElement("small", { textContent: dateTime(trip.lastUpdatedAt) })],
+        [
+          createElement("small", { textContent: "Proposé par :" }),
+          createElement("br"),
+          createElement("strong", { textContent: text(trip.ownerName, "") }),
+          createElement("br"),
+          createElement("small", { textContent: dateTime(trip.lastUpdatedAt) }),
+        ],
         "",
       ),
       createElement("td", { textContent: number(trip.observers) }),
@@ -957,7 +963,13 @@ function renderTripHistory(trips) {
         "",
       ),
       createCellWithContent(
-        [createElement("strong", { textContent: text(trip.ownerName, "") }), createElement("br"), createElement("small", { textContent: text(trip.ownerRole, "") })],
+        [
+          createElement("small", { textContent: "Proposé par :" }),
+          createElement("br"),
+          createElement("strong", { textContent: text(trip.ownerName, "") }),
+          createElement("br"),
+          createElement("small", { textContent: text(trip.ownerRole, "") }),
+        ],
         "",
       ),
       createCellWithContent(
@@ -1289,8 +1301,9 @@ function renderMapSidePanel(liveTrips, visibleLines, liveUsers, showUsers = true
           const gps = trip.liveLocation || {};
           const gpsAge = gpsAgeLabel(gps.timestamp || trip.lastUpdatedAt);
           const status = trip.offRouteSince ? "hors trace" : gpsAge;
+          const ownerName = text(trip.ownerName, "").trim();
           const button = createElement("button", {
-            className: "map-live-item",
+            className: "map-live-item map-live-trip-item",
             attributes: {
               type: "button",
               "data-map-line": trip.lineCode,
@@ -1299,7 +1312,15 @@ function renderMapSidePanel(liveTrips, visibleLines, liveUsers, showUsers = true
           appendChildren(
             button,
             createElement("span", { className: "" }),
-            createElement("strong", { textContent: text(trip.ownerName || "Trajet live", "") }),
+            ...(ownerName
+              ? [
+                  createElement("small", { textContent: "Proposé par :" }),
+                  createElement("strong", {
+                    className: "map-live-trip-name",
+                    textContent: ownerName,
+                  }),
+                ]
+              : [createElement("strong", { textContent: "Trajet live" })]),
             createElement("small", { textContent: `${number(trip.speedKmh, 1)} km/h - ${number(trip.observers)} observateur(s) - ${text(status, "")}` }),
           );
           button.firstElementChild.appendChild(linePill(trip.displayCode, trip.colorValue));
@@ -2089,8 +2110,15 @@ function handleMapPointer(event) {
     );
   } else {
     const trip = marker.trip;
+    const ownerName = text(trip.ownerName, "").trim();
     tooltip.replaceChildren(
-      createElement("strong", { textContent: `${text(trip.displayCode, "")} - ${text(trip.ownerName, "")}` }),
+      createElement("strong", { textContent: text(trip.displayCode, "") }),
+      ...(ownerName
+        ? [
+            createElement("span", { textContent: "Proposé par :" }),
+            createElement("strong", { textContent: ownerName }),
+          ]
+        : []),
       createElement("span", { textContent: `${number(trip.speedKmh, 1)} km/h - ${number(trip.observers)} observateur(s)` }),
       createElement("span", { textContent: `GPS ${text(gpsAgeLabel(trip.liveLocation?.timestamp || trip.lastUpdatedAt), "")}` }),
     );
@@ -2291,9 +2319,18 @@ document.addEventListener("click", async (event) => {
     const trip = (state.dashboard?.liveTrips || []).find((item) => item.id === tripId);
     state.stopTripId = tripId;
     state.stopTripLabel = trip
-      ? `${trip.displayCode} - ${trip.ownerName}`
+      ? `${trip.displayCode} - Proposé par : ${trip.ownerName}`
       : tripId;
-    $("stopTripLabel").textContent = state.stopTripLabel;
+    if (trip) {
+      $("stopTripLabel").replaceChildren(
+        createElement("span", {
+          textContent: `${trip.displayCode} - Proposé par : `,
+        }),
+        createElement("strong", { textContent: text(trip.ownerName, "") }),
+      );
+    } else {
+      $("stopTripLabel").textContent = state.stopTripLabel;
+    }
     $("stopReason").value = `Trajet arrete par un administrateur Piwibus : anomalie constatee sur le suivi live.`;
     $("stopDialog").showModal();
     return;

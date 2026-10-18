@@ -52,9 +52,7 @@ void main() {
       expect(duplicate['tripLikeChanged'], isFalse);
       final activityCount =
           (store.snapshot('owner-session')['activity'] as List)
-              .where(
-                (item) => item is Map && item['title'] == "Nouveau j'aime",
-              )
+              .where((item) => item is Map && item['title'] == "Nouveau j'aime")
               .length;
       expect(activityCount, 1);
     });
@@ -71,10 +69,21 @@ void main() {
           'fullName': 'Alice Owner',
           'email': 'alice@example.com',
           'password': 'password123',
+          'profilePhotoDataUrl': _tinyPngDataUrl,
         });
         await store.register('test-session-2', <String, dynamic>{
           'fullName': 'Bob Observer',
           'email': 'bob@example.com',
+          'password': 'password123',
+        });
+        await store.register('test-session-3', <String, dynamic>{
+          'fullName': 'Charlie Observer',
+          'email': 'charlie@example.com',
+          'password': 'password123',
+        });
+        await store.register('outsider-session', <String, dynamic>{
+          'fullName': 'Unaffiliated User',
+          'email': 'outsider@example.com',
           'password': 'password123',
         });
         await store.startTrip('test-session-1', <String, dynamic>{
@@ -105,14 +114,129 @@ void main() {
           orElse: () => <String, dynamic>{},
         );
         expect(observerTripConversation, isNotEmpty);
+        final tripPeer = observerTripConversation['peerUser'] as Map;
+        expect(tripPeer.containsKey('profilePhotoDataUrl'), isFalse);
 
         final sent = await store.sendMessageItem(
           'test-session-2',
           _string(observerTripConversation['id']),
-          <String, dynamic>{'body': 'Bonjour tout le monde'},
+          <String, dynamic>{
+            'body': 'Bonjour tout le monde',
+            'messageId': 'retryable-message-1',
+          },
         );
         expect(sent['conversation']['kind'], 'trip');
         expect(sent['conversation']['tripId'], tripId);
+        final conversationId = _string(observerTripConversation['id']);
+        final sentMessage = sent['message'] as Map<String, dynamic>;
+        final sequence = sentMessage['sequence'];
+        final retried = await store.sendMessageItem(
+          'test-session-2',
+          conversationId,
+          <String, dynamic>{
+            'body': 'Bonjour tout le monde',
+            'messageId': 'retryable-message-1',
+          },
+        );
+        final retriedMessage = retried['message'] as Map<String, dynamic>;
+        expect(retriedMessage['id'], sentMessage['id']);
+        expect(
+          store.conversationMessages('test-session-2', conversationId),
+          hasLength(1),
+        );
+        await store.selectTrip('test-session-3', tripId);
+        final charlieConversation = store
+            .messageConversationsForSession('test-session-3')
+            .firstWhere(
+              (conversation) =>
+                  conversation['kind'] == 'trip' &&
+                  conversation['tripId'] == tripId,
+            );
+        expect(charlieConversation['unreadCount'], 0);
+
+        expect(
+          store
+              .conversationMessages('test-session-2', conversationId)
+              .single['deliveryState'],
+          'sent',
+        );
+        await expectLater(
+          store.markMessageConversationDelivered(
+            'outsider-session',
+            conversationId,
+            <String, dynamic>{'throughSequence': sequence},
+          ),
+          throwsStateError,
+        );
+
+        await store.markMessageConversationDelivered(
+          'test-session-1',
+          conversationId,
+          <String, dynamic>{'throughSequence': sequence},
+        );
+        expect(
+          store
+              .conversationMessages('test-session-2', conversationId)
+              .single['deliveryState'],
+          'delivered',
+        );
+
+        await store.markMessageConversationRead(
+          'test-session-1',
+          conversationId,
+          <String, dynamic>{'throughSequence': sequence},
+        );
+        expect(
+          store
+              .conversationMessages('test-session-2', conversationId)
+              .single['deliveryState'],
+          'read',
+        );
+      },
+    );
+
+    test(
+      'direct conversations include a recipient photo only when present',
+      () async {
+        final store = await _openTempStore('piwibus-direct-chat-photo');
+        await store.register('sender-session', <String, dynamic>{
+          'fullName': 'Sender',
+          'email': 'sender@example.com',
+          'password': 'password123',
+        });
+        await store.register('photo-peer-session', <String, dynamic>{
+          'fullName': 'Peer With Photo',
+          'email': 'photo-peer@example.com',
+          'password': 'password123',
+          'profilePhotoDataUrl': _tinyPngDataUrl,
+        });
+        await store.register('plain-peer-session', <String, dynamic>{
+          'fullName': 'Peer Without Photo',
+          'email': 'plain-peer@example.com',
+          'password': 'password123',
+        });
+
+        final photoPeerId =
+            (store.snapshot('photo-peer-session')['currentUser'] as Map)['id']
+                as String;
+        final photoConversation = await store.startMessageConversation(
+          'sender-session',
+          <String, dynamic>{'peerUserId': photoPeerId},
+        );
+        final photoPeer =
+            (photoConversation['conversation'] as Map)['peerUser'] as Map;
+        expect(photoPeer['profilePhotoDataUrl'], _tinyPngDataUrl);
+
+        final plainPeerId =
+            (store.snapshot('plain-peer-session')['currentUser'] as Map)['id']
+                as String;
+        final plainConversation = await store.startMessageConversation(
+          'sender-session',
+          <String, dynamic>{'peerUserId': plainPeerId},
+        );
+        final plainPeer =
+            (plainConversation['conversation'] as Map)['peerUser'] as Map;
+        expect(plainPeer.containsKey('profilePhotoDataUrl'), isFalse);
       },
     );
 

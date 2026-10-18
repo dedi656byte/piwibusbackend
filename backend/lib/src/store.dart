@@ -145,10 +145,8 @@ class PiwibusStore {
   static const Duration _sessionTouchInterval = Duration(minutes: 5);
   static const Duration _observerSessionFreshness = Duration(minutes: 6);
   static const Duration _currentLocationFreshness = Duration(minutes: 5);
-  static const Duration _completedTripRetention = Duration(days: 30);
   static const Duration _tripMessageRetention = Duration(days: 30);
   static const Duration _reportRetention = Duration(days: 30);
-  static const int _maxRetainedCompletedTrips = 500;
   static const int _maxRetainedMessagesPerTrip = 80;
   static const int _maxRetainedReports = 500;
   static const Duration _liveLocationMaxSampleAge = Duration(seconds: 60);
@@ -188,6 +186,8 @@ class PiwibusStore {
   int _sharedRevision = 0;
   Future<void> Function()? _publishSharedChange;
   StreamSubscription<void>? _externalChangeSubscription;
+  int _activePersistenceWrites = 0;
+  bool _externalReloadPending = false;
 
   JsonMap _state = <String, dynamic>{};
   final Map<String, int> _sessionConnectionCounts = <String, int>{};
@@ -244,7 +244,13 @@ class PiwibusStore {
   void listenToExternalChanges(Stream<void> changes) {
     _externalChangeSubscription?.cancel();
     _externalChangeSubscription = changes.listen((_) async {
-      await _reloadStateFromPersistence();
+      if (_activePersistenceWrites > 0) {
+        _externalReloadPending = true;
+        return;
+      }
+      if (await _persistence.hasExternalChanges()) {
+        await _reloadStateFromPersistence();
+      }
       _notifySharedChange(publishExternal: false);
     });
   }
@@ -515,9 +521,6 @@ class PiwibusStore {
     final persisted = await _persistence.loadState();
     if (persisted == null) return;
     _state = _normalizeState(persisted);
-    if (_ensureBootstrapAdminFromEnv()) {
-      await _saveState();
-    }
     _enforceNoDefaultAdminPassword();
   }
 
@@ -540,6 +543,9 @@ class PiwibusStore {
   }
 
   Future<String> ensureSession(String? sessionId) async {
+    if (await _persistence.hasExternalChanges()) {
+      await _reloadStateFromPersistence();
+    }
     final candidate = sessionId?.trim() ?? '';
     String effectiveSessionId;
     final sessions = _sessions();
@@ -1569,7 +1575,7 @@ class PiwibusStore {
       title: 'Notification admin',
       subtitle: '$targetLabel - $title - $body',
       iconKey: 'notification',
-      colorValue: 0xFF0F8B8D,
+      colorValue: 0xFF0F766E,
       audienceSessionIds: audienceSessionIds,
     );
     _notifySharedChange();
@@ -1971,6 +1977,12 @@ class PiwibusStore {
         'readSequences': <String, int>{
           for (final participantId in participantIds) participantId: 0,
         },
+        'readReceiptSequences': <String, int>{
+          for (final participantId in participantIds) participantId: 0,
+        },
+        'deliveredSequences': <String, int>{
+          for (final participantId in participantIds) participantId: 0,
+        },
         'createdAt': now,
         'updatedAt': now,
         'messages': <JsonMap>[],
@@ -2026,10 +2038,24 @@ class PiwibusStore {
       final normalizedParticipantIds = participantIds.toList(growable: false)
         ..sort();
       final readSequences = _sequenceMap(conversation['readSequences']);
+      final readReceiptSequences = _sequenceMap(
+        conversation['readReceiptSequences'],
+      );
+      final deliveredSequences = _sequenceMap(
+        conversation['deliveredSequences'],
+      );
       for (final participantId in normalizedParticipantIds) {
         readSequences.putIfAbsent(
           participantId,
           () => _int(conversation['messageCursor']),
+        );
+        deliveredSequences.putIfAbsent(
+          participantId,
+          () => 0,
+        );
+        readReceiptSequences.putIfAbsent(
+          participantId,
+          () => 0,
         );
       }
       conversation['participantIds'] = normalizedParticipantIds;
@@ -2037,6 +2063,8 @@ class PiwibusStore {
       conversation['subtitle'] = subtitle;
       conversation['tripId'] = tripId;
       conversation['readSequences'] = readSequences;
+      conversation['readReceiptSequences'] = readReceiptSequences;
+      conversation['deliveredSequences'] = deliveredSequences;
       conversation['updatedAt'] = now;
       conversations[existingIndex] = conversation;
       _state['messageConversations'] = conversations;
@@ -2069,6 +2097,12 @@ class PiwibusStore {
       'readSequences': <String, int>{
         for (final participantId in normalizedParticipantIds) participantId: 0,
       },
+      'readReceiptSequences': <String, int>{
+        for (final participantId in normalizedParticipantIds) participantId: 0,
+      },
+      'deliveredSequences': <String, int>{
+        for (final participantId in normalizedParticipantIds) participantId: 0,
+      },
       'createdAt': now,
       'updatedAt': now,
       'messages': <JsonMap>[],
@@ -2097,6 +2131,21 @@ class PiwibusStore {
       currentUserId,
     );
     if (conversation == null) return const <JsonMap>[];
+    final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
+    final readReceiptSequences = _sequenceMap(
+      conversation['readReceiptSequences'],
+    );
+    final otherParticipantIds = _stringList(conversation['participantIds'])
+        .where((id) => id != currentUserId)
+        .toList(growable: false);
+    final deliveredThrough = otherParticipantIds.fold<int>(
+      0,
+      (max, id) => math.max(max, deliveredSequences[id] ?? 0),
+    );
+    final readThrough = otherParticipantIds.fold<int>(
+      0,
+      (max, id) => math.max(max, readReceiptSequences[id] ?? 0),
+    );
     final normalizedLimit = limit.clamp(1, _maxMessagePageLimit).toInt();
     final messages = _mapList(conversation['messages'])
       ..sort((a, b) {
@@ -2122,7 +2171,19 @@ class PiwibusStore {
     } else if (result.length > normalizedLimit) {
       result = result.take(normalizedLimit).toList(growable: false);
     }
-    return result.map(_publicMessageItem).toList(growable: false);
+    return result
+        .map(
+          (message) => _publicMessageItem(
+            message,
+            deliveryState: _messageDeliveryState(
+              message,
+              currentUserId: currentUserId,
+              deliveredThrough: deliveredThrough,
+              readThrough: readThrough,
+            ),
+          ),
+        )
+        .toList(growable: false);
   }
 
   Future<JsonMap> sendMessageItem(
@@ -2202,9 +2263,14 @@ class PiwibusStore {
     messages.add(message);
     final readSequences = _sequenceMap(conversation['readSequences']);
     readSequences[currentUserId] = nextSequence;
+    final deliveredSequences = _sequenceMap(
+      conversation['deliveredSequences'],
+    );
+    deliveredSequences[currentUserId] = nextSequence;
     conversation['messages'] = messages;
     conversation['messageCursor'] = nextSequence;
     conversation['readSequences'] = readSequences;
+    conversation['deliveredSequences'] = deliveredSequences;
     conversation['lastMessagePreview'] = _messagePreview(text);
     conversation['lastMessageId'] = effectiveMessageId;
     conversation['lastSenderId'] = currentUserId;
@@ -2239,6 +2305,7 @@ class PiwibusStore {
     if (index < 0) {
       return <String, dynamic>{'conversationId': conversationId, 'ok': true};
     }
+
     final conversation = conversations[index];
     if (!_stringList(conversation['participantIds']).contains(currentUserId)) {
       throw StateError('Acces refuse pour cette conversation.');
@@ -2246,16 +2313,84 @@ class PiwibusStore {
     final requestedThroughSequence = _int(
       body['throughSequence'] ?? body['through_sequence'],
     );
-    final throughSequence = requestedThroughSequence > 0
-        ? requestedThroughSequence
-        : _int(conversation['messageCursor']);
+    final throughSequence = math.min(
+      requestedThroughSequence > 0
+          ? requestedThroughSequence
+          : _int(conversation['messageCursor']),
+      _int(conversation['messageCursor']),
+    );
     final readSequences = _sequenceMap(conversation['readSequences']);
     final currentReadSequence = readSequences[currentUserId] ?? 0;
-    if (throughSequence <= currentReadSequence) {
+    final readReceiptSequences = _sequenceMap(
+      conversation['readReceiptSequences'],
+    );
+    final currentReceiptSequence = readReceiptSequences[currentUserId] ?? 0;
+    if (throughSequence <= currentReadSequence &&
+        throughSequence <= currentReceiptSequence) {
       return <String, dynamic>{'conversationId': conversationId, 'ok': true};
     }
-    readSequences[currentUserId] = throughSequence;
+    readSequences[currentUserId] = math.max(
+      currentReadSequence,
+      throughSequence,
+    );
+    readReceiptSequences[currentUserId] = math.max(
+      currentReceiptSequence,
+      throughSequence,
+    );
+    final deliveredSequences = _sequenceMap(
+      conversation['deliveredSequences'],
+    );
+    deliveredSequences[currentUserId] = math.max(
+      deliveredSequences[currentUserId] ?? 0,
+      throughSequence,
+    );
     conversation['readSequences'] = readSequences;
+    conversation['readReceiptSequences'] = readReceiptSequences;
+    conversation['deliveredSequences'] = deliveredSequences;
+    conversations[index] = conversation;
+    _state['messageConversations'] = conversations;
+    _notifySharedChange();
+    await _persist(const StateMutationBatch(messageConversations: true));
+    return <String, dynamic>{'conversationId': conversationId, 'ok': true};
+  }
+
+  Future<JsonMap> markMessageConversationDelivered(
+    String sessionId,
+    String conversationId,
+    JsonMap body,
+  ) async {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final conversations = _messageConversations();
+    final index = conversations.indexWhere(
+      (conversation) => _text(conversation['id']) == conversationId,
+    );
+    if (index < 0) {
+      return <String, dynamic>{'conversationId': conversationId, 'ok': true};
+    }
+    final conversation = conversations[index];
+    if (!_stringList(conversation['participantIds']).contains(currentUserId)) {
+      throw StateError('Acces refuse pour cette conversation.');
+    }
+    final requestedThroughSequence = _int(
+      body['throughSequence'] ?? body['through_sequence'],
+    );
+    final throughSequence = math.min(
+      requestedThroughSequence > 0
+          ? requestedThroughSequence
+          : _int(conversation['messageCursor']),
+      _int(conversation['messageCursor']),
+    );
+    if (throughSequence <= 0) {
+      return <String, dynamic>{'conversationId': conversationId, 'ok': true};
+    }
+    final deliveredSequences = _sequenceMap(
+      conversation['deliveredSequences'],
+    );
+    if (throughSequence <= (deliveredSequences[currentUserId] ?? 0)) {
+      return <String, dynamic>{'conversationId': conversationId, 'ok': true};
+    }
+    deliveredSequences[currentUserId] = throughSequence;
+    conversation['deliveredSequences'] = deliveredSequences;
     conversations[index] = conversation;
     _state['messageConversations'] = conversations;
     _notifySharedChange();
@@ -2318,7 +2453,7 @@ class PiwibusStore {
       title: 'Code mot de passe',
       subtitle: 'Un code de reinitialisation a ete envoye a $email.',
       iconKey: 'auth',
-      colorValue: 0xFF0F8B8D,
+      colorValue: 0xFF0F766E,
       audienceSessionIds: _sessionIdsForUser(user),
     );
     _notifySharedChange();
@@ -2397,7 +2532,7 @@ class PiwibusStore {
       title: 'Mot de passe reinitialise',
       subtitle: 'Le compte $email peut se reconnecter.',
       iconKey: 'auth',
-      colorValue: 0xFF0F8B8D,
+      colorValue: 0xFF0F766E,
       audienceSessionIds: _sessionIdsForUser(user)..add(sessionId),
     );
     _notifySharedChange();
@@ -3340,16 +3475,8 @@ class PiwibusStore {
     var sessionsChanged = false;
 
     final trips = _trips();
-    final retainedCompletedTripIds = _retainedCompletedTripIds(trips, now);
     final nextTrips = <JsonMap>[];
     for (final trip in trips) {
-      final tripId = _text(trip['id']);
-      final isActive = _text(trip['status']) == 'actif';
-      if (!isActive && !retainedCompletedTripIds.contains(tripId)) {
-        tripsChanged = true;
-        continue;
-      }
-
       final messages = _mapList(trip['messages']);
       final retainedMessages = _retainedTripMessages(messages, now);
       if (retainedMessages.length != messages.length) {
@@ -3420,6 +3547,9 @@ class PiwibusStore {
         found = true;
         if (!_canManageTrip(sessionId, session, trip)) {
           throw StateError('Accès refusé pour ce trajet.');
+        }
+        if (_text(trip['status']) != 'actif') {
+          return snapshot(sessionId);
         }
         _addTripNetworkUsage(
           trip,
@@ -3535,7 +3665,7 @@ class PiwibusStore {
       title: 'Message publié',
       subtitle: 'Chat du trajet mis à  jour.',
       iconKey: 'chat',
-      colorValue: 0xFF0F8B8D,
+      colorValue: 0xFF0F766E,
       audienceSessionIds: activityAudience,
     );
     _notifySharedChange();
@@ -3616,9 +3746,9 @@ class PiwibusStore {
     trip['likedByActorIds'] = likedBy.toList(growable: false)..sort();
     _state['trips'] = trips;
     if (liked) {
-      final activityAudience = notificationAudienceForTripOwner(tripId)
-          .sessionIds
-        ..remove(sessionId);
+      final activityAudience = notificationAudienceForTripOwner(
+        tripId,
+      ).sessionIds..remove(sessionId);
       addActivity(
         title: 'Nouveau j\'aime',
         subtitle: 'Votre trajet a reçu un nouveau j\'aime.',
@@ -3628,13 +3758,8 @@ class PiwibusStore {
       );
     }
     _notifySharedChange();
-    await _persist(
-      StateMutationBatch(trips: true, activity: liked),
-    );
-    return <String, dynamic>{
-      ...snapshot(sessionId),
-      'tripLikeChanged': liked,
-    };
+    await _persist(StateMutationBatch(trips: true, activity: liked));
+    return <String, dynamic>{...snapshot(sessionId), 'tripLikeChanged': liked};
   }
 
   Future<JsonMap> createReport(String sessionId, JsonMap body) async {
@@ -3712,7 +3837,7 @@ class PiwibusStore {
       title: 'Signalement enregistré',
       subtitle: 'Bus ${report['busNumber']} publié immédiatement.',
       iconKey: 'report',
-      colorValue: 0xFF0F8B8D,
+      colorValue: 0xFF0F766E,
       audienceSessionIds: <String>[sessionId],
     );
     _notifySharedChange();
@@ -3785,7 +3910,9 @@ class PiwibusStore {
     final currentStatus = _text(targetUser['status']);
 
     // 1. Anti-auto-suspension : un administrateur ne peut pas suspendre son propre compte
-    if (currentAdminId.isNotEmpty && currentAdminId == userId && currentStatus == 'actif') {
+    if (currentAdminId.isNotEmpty &&
+        currentAdminId == userId &&
+        currentStatus == 'actif') {
       throw StateError(
         'Auto-suspension interdite : un administrateur ne peut pas suspendre son propre compte.',
       );
@@ -3798,9 +3925,7 @@ class PiwibusStore {
       );
     }
 
-    targetUser['status'] = currentStatus == 'actif'
-        ? 'suspendu'
-        : 'actif';
+    targetUser['status'] = currentStatus == 'actif' ? 'suspendu' : 'actif';
     targetUser['lastSeenAt'] = _nowIso();
     _state['users'] = users;
     addActivity(
@@ -4064,6 +4189,25 @@ class PiwibusStore {
       orElse: () => '',
     );
     final readSequences = _sequenceMap(conversation['readSequences']);
+    final readReceiptSequences = _sequenceMap(
+      conversation['readReceiptSequences'],
+    );
+    final deliveredSequences = _sequenceMap(
+      conversation['deliveredSequences'],
+    );
+    final otherParticipantIds = participantIds
+        .where((id) => id != currentUserId)
+        .toList(growable: false);
+    final deliveredThrough = otherParticipantIds.fold<int>(
+      0,
+      (max, participantId) =>
+          math.max(max, deliveredSequences[participantId] ?? 0),
+    );
+    final recipientReadThrough = otherParticipantIds.fold<int>(
+      0,
+      (max, participantId) =>
+          math.max(max, readReceiptSequences[participantId] ?? 0),
+    );
     final readThrough = readSequences[currentUserId] ?? 0;
     final unreadCount = math.max(
       0,
@@ -4084,7 +4228,12 @@ class PiwibusStore {
       'participantIds': participantIds,
       if (_text(conversation['tripId']).isNotEmpty)
         'tripId': _text(conversation['tripId']),
-      'peerUser': peerUser == null ? null : _publicMessagingPeerUser(peerUser),
+      'peerUser': peerUser == null
+          ? null
+          : _publicMessagingPeerUser(
+              peerUser,
+              includeProfilePhotoDataUrl: kind == 'direct',
+            ),
       'title': title,
       'subtitle': _text(conversation['subtitle']),
       'lastMessagePreview': _text(conversation['lastMessagePreview']),
@@ -4094,12 +4243,32 @@ class PiwibusStore {
         'lastSenderId': _text(conversation['lastSenderId']),
       'unreadCount': unreadCount,
       'messageCursor': _int(conversation['messageCursor']),
+      'deliveredThrough': deliveredThrough,
+      'readThrough': recipientReadThrough,
       'createdAt': _text(conversation['createdAt']),
       'updatedAt': _text(conversation['updatedAt']),
     };
   }
 
-  JsonMap _publicMessageItem(JsonMap message) {
+  String _messageDeliveryState(
+    JsonMap message, {
+    required String currentUserId,
+    required int deliveredThrough,
+    required int readThrough,
+  }) {
+    if (_text(message['senderId'] ?? message['sender_id']) != currentUserId) {
+      return 'sent';
+    }
+    final sequence = _int(message['sequence']);
+    if (sequence <= readThrough) return 'read';
+    if (sequence <= deliveredThrough) return 'delivered';
+    return 'sent';
+  }
+
+  JsonMap _publicMessageItem(
+    JsonMap message, {
+    String deliveryState = 'sent',
+  }) {
     return <String, dynamic>{
       'id': _text(message['id']),
       'conversationId': _text(
@@ -4110,6 +4279,7 @@ class PiwibusStore {
       'body': _text(message['body']),
       'sequence': _int(message['sequence']),
       'createdAt': _text(message['createdAt'] ?? message['created_at']),
+      'deliveryState': deliveryState,
     };
   }
 
@@ -4988,6 +5158,12 @@ class PiwibusStore {
       'readSequences': _sequenceMap(
         input['readSequences'] ?? input['read_sequences'],
       ),
+      'readReceiptSequences': _sequenceMap(
+        input['readReceiptSequences'] ?? input['read_receipt_sequences'],
+      ),
+      'deliveredSequences': _sequenceMap(
+        input['deliveredSequences'] ?? input['delivered_sequences'],
+      ),
       'createdAt': _dateValue(input['createdAt'] ?? input['created_at']),
       'updatedAt': _dateValue(input['updatedAt'] ?? input['updated_at']),
       'messages': messages
@@ -5795,30 +5971,6 @@ class PiwibusStore {
     return false;
   }
 
-  Set<String> _retainedCompletedTripIds(List<JsonMap> trips, DateTime now) {
-    final candidates =
-        trips
-            .where((trip) => _text(trip['status']) != 'actif')
-            .where((trip) => _text(trip['id']).isNotEmpty)
-            .where(
-              (trip) => !_isOlderThan(
-                trip['lastUpdatedAt'] ?? trip['startedAt'],
-                now,
-                _completedTripRetention,
-              ),
-            )
-            .toList(growable: false)
-          ..sort(
-            (a, b) => _dateOrEpoch(
-              b['lastUpdatedAt'] ?? b['startedAt'],
-            ).compareTo(_dateOrEpoch(a['lastUpdatedAt'] ?? a['startedAt'])),
-          );
-    return candidates
-        .take(_maxRetainedCompletedTrips)
-        .map((trip) => _text(trip['id']))
-        .toSet();
-  }
-
   List<JsonMap> _retainedTripMessages(List<JsonMap> messages, DateTime now) {
     if (messages.isEmpty) return messages;
     final retained = messages
@@ -6234,7 +6386,24 @@ class PiwibusStore {
   }
 
   Future<void> _persist(StateMutationBatch batch) async {
-    await _persistence.applyMutations(state: _state, batch: batch);
+    _activePersistenceWrites += 1;
+    try {
+      await _persistence.applyMutations(state: _state, batch: batch);
+    } on ConcurrentStateMutationException catch (error, stackTrace) {
+      await _reloadStateFromPersistence();
+      _externalReloadPending = false;
+      _notifySharedChange(publishExternal: false);
+      Error.throwWithStackTrace(error, stackTrace);
+    } finally {
+      _activePersistenceWrites -= 1;
+      if (_activePersistenceWrites == 0 && _externalReloadPending) {
+        _externalReloadPending = false;
+        if (await _persistence.hasExternalChanges()) {
+          await _reloadStateFromPersistence();
+        }
+        _notifySharedChange(publishExternal: false);
+      }
+    }
   }
 
   Future<void> close() async {
