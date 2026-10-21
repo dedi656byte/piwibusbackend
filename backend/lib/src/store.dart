@@ -174,6 +174,8 @@ class PiwibusStore {
   static const int _maxBusNumberLength = 32;
   static const int _maxLineLabelLength = 160;
   static const int _maxMessageLength = 1000;
+  static const int _maxMessageAttachmentDataUrlLength = 360000;
+  static const int _maxMessageAttachmentBytes = 256 * 1024;
   static const int _maxMessagePageLimit = 80;
   static const int _defaultMessagePageLimit = 40;
   static const int _defaultMessagePeerCandidateLimit = 20;
@@ -1974,6 +1976,7 @@ class PiwibusStore {
         'lastMessageId': null,
         'lastSenderId': null,
         'messageCursor': 0,
+        'messageRevision': 0,
         'readSequences': <String, int>{
           for (final participantId in participantIds) participantId: 0,
         },
@@ -2049,19 +2052,17 @@ class PiwibusStore {
           participantId,
           () => _int(conversation['messageCursor']),
         );
-        deliveredSequences.putIfAbsent(
-          participantId,
-          () => 0,
-        );
-        readReceiptSequences.putIfAbsent(
-          participantId,
-          () => 0,
-        );
+        deliveredSequences.putIfAbsent(participantId, () => 0);
+        readReceiptSequences.putIfAbsent(participantId, () => 0);
       }
       conversation['participantIds'] = normalizedParticipantIds;
       conversation['title'] = title;
       conversation['subtitle'] = subtitle;
       conversation['tripId'] = tripId;
+      conversation['messageRevision'] = _int(conversation['messageRevision']);
+      if (ownerUserId.isNotEmpty) {
+        conversation['tripOwnerUserId'] = ownerUserId;
+      }
       conversation['readSequences'] = readSequences;
       conversation['readReceiptSequences'] = readReceiptSequences;
       conversation['deliveredSequences'] = deliveredSequences;
@@ -2088,6 +2089,8 @@ class PiwibusStore {
       'kind': 'trip',
       'participantIds': normalizedParticipantIds,
       'tripId': tripId,
+      'tripOwnerUserId': ownerUserId,
+      'messageRevision': 0,
       'title': title,
       'subtitle': subtitle,
       'lastMessagePreview': '',
@@ -2122,6 +2125,7 @@ class PiwibusStore {
     String sessionId,
     String conversationId, {
     int afterSequence = 0,
+    int afterRevision = 0,
     int beforeSequence = 0,
     int limit = _defaultMessagePageLimit,
   }) {
@@ -2135,9 +2139,9 @@ class PiwibusStore {
     final readReceiptSequences = _sequenceMap(
       conversation['readReceiptSequences'],
     );
-    final otherParticipantIds = _stringList(conversation['participantIds'])
-        .where((id) => id != currentUserId)
-        .toList(growable: false);
+    final otherParticipantIds = _stringList(
+      conversation['participantIds'],
+    ).where((id) => id != currentUserId).toList(growable: false);
     final deliveredThrough = otherParticipantIds.fold<int>(
       0,
       (max, id) => math.max(max, deliveredSequences[id] ?? 0),
@@ -2156,7 +2160,11 @@ class PiwibusStore {
         return _text(a['createdAt']).compareTo(_text(b['createdAt']));
       });
     Iterable<JsonMap> filtered = messages;
-    if (afterSequence > 0) {
+    if (afterRevision > 0) {
+      filtered = filtered.where(
+        (message) => _int(message['updateRevision']) > afterRevision,
+      );
+    } else if (afterSequence > 0) {
       filtered = filtered.where(
         (message) => _int(message['sequence']) > afterSequence,
       );
@@ -2175,6 +2183,8 @@ class PiwibusStore {
         .map(
           (message) => _publicMessageItem(
             message,
+            currentUserId: currentUserId,
+            tripOwnerUserId: _tripOwnerUserIdForConversation(conversation),
             deliveryState: _messageDeliveryState(
               message,
               currentUserId: currentUserId,
@@ -2207,7 +2217,12 @@ class PiwibusStore {
       _maxMessageLength,
       fieldName: 'Message',
     );
-    if (text.trim().isEmpty) throw StateError('Le message est vide.');
+    final attachmentDataUrl = _messageAttachmentDataUrlFrom(
+      body['attachmentDataUrl'] ?? body['attachment_data_url'],
+    );
+    if (text.trim().isEmpty && attachmentDataUrl == null) {
+      throw StateError('Le message est vide.');
+    }
     final user = _currentUser(_session(sessionId));
     final requestedMessageId = _clientIdOrEmpty(
       body['messageId'] ?? body['message_id'],
@@ -2229,7 +2244,11 @@ class PiwibusStore {
     );
     if (duplicate.isNotEmpty) {
       return <String, dynamic>{
-        'message': _publicMessageItem(duplicate),
+        'message': _publicMessageItem(
+          duplicate,
+          currentUserId: currentUserId,
+          tripOwnerUserId: _tripOwnerUserIdForConversation(conversation),
+        ),
         'conversation': _publicMessageConversation(
           conversation,
           currentUserId: currentUserId,
@@ -2249,6 +2268,30 @@ class PiwibusStore {
           ),
         ) +
         1;
+    final replyToMessageId = _clientIdOrEmpty(
+      body['replyToMessageId'] ?? body['reply_to_message_id'],
+      fieldName: 'Message cité',
+    );
+    JsonMap? replyTo;
+    if (replyToMessageId.isNotEmpty) {
+      if (_text(conversation['kind']) != 'trip') {
+        throw StateError(
+          'Les réponses citées sont réservées aux discussions de groupe.',
+        );
+      }
+      final repliedMessage = messages.firstWhere(
+        (existingMessage) => _text(existingMessage['id']) == replyToMessageId,
+        orElse: () => <String, dynamic>{},
+      );
+      if (repliedMessage.isEmpty) {
+        throw StateError('Le message cité est introuvable.');
+      }
+      replyTo = <String, dynamic>{
+        'messageId': replyToMessageId,
+        'senderName': _text(repliedMessage['senderName']),
+        'excerpt': _messagePreview(_text(repliedMessage['body'])),
+      };
+    }
     final message = <String, dynamic>{
       'id': effectiveMessageId,
       'conversationId': conversationId,
@@ -2259,19 +2302,28 @@ class PiwibusStore {
       'body': text.trim(),
       'sequence': nextSequence,
       'createdAt': createdAt,
+      if (replyTo != null) 'replyTo': replyTo,
+      if (attachmentDataUrl != null) ...<String, dynamic>{
+        'attachmentDataUrl': attachmentDataUrl,
+        'attachmentMimeType': attachmentDataUrl.substring(
+          5,
+          attachmentDataUrl.indexOf(';'),
+        ),
+      },
     };
+    _advanceMessageRevision(conversation, message);
     messages.add(message);
     final readSequences = _sequenceMap(conversation['readSequences']);
     readSequences[currentUserId] = nextSequence;
-    final deliveredSequences = _sequenceMap(
-      conversation['deliveredSequences'],
-    );
+    final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
     deliveredSequences[currentUserId] = nextSequence;
     conversation['messages'] = messages;
     conversation['messageCursor'] = nextSequence;
     conversation['readSequences'] = readSequences;
     conversation['deliveredSequences'] = deliveredSequences;
-    conversation['lastMessagePreview'] = _messagePreview(text);
+    conversation['lastMessagePreview'] = _messagePreview(
+      text.trim().isEmpty ? 'Photo' : text,
+    );
     conversation['lastMessageId'] = effectiveMessageId;
     conversation['lastSenderId'] = currentUserId;
     conversation['updatedAt'] = createdAt;
@@ -2280,7 +2332,11 @@ class PiwibusStore {
     _notifySharedChange();
     await _persist(const StateMutationBatch(messageConversations: true));
     return <String, dynamic>{
-      'message': _publicMessageItem(message),
+      'message': _publicMessageItem(
+        message,
+        currentUserId: currentUserId,
+        tripOwnerUserId: _text(conversation['tripOwnerUserId']),
+      ),
       'conversation': _publicMessageConversation(
         conversation,
         currentUserId: currentUserId,
@@ -2290,6 +2346,288 @@ class PiwibusStore {
           .where((participantId) => participantId != currentUserId)
           .toList(growable: false),
     };
+  }
+
+  JsonMap messageAttachment(
+    String sessionId,
+    String conversationId,
+    String messageId,
+  ) {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final conversation = _messageConversations()
+        .where((item) => _text(item['id']) == conversationId)
+        .firstOrNull;
+    if (conversation == null) throw StateError('Conversation introuvable.');
+    if (!_stringList(conversation['participantIds']).contains(currentUserId)) {
+      throw StateError('Acces refuse pour cette conversation.');
+    }
+    final message = _mapList(
+      conversation['messages'],
+    ).where((item) => _text(item['id']) == messageId).firstOrNull;
+    if (message == null) throw StateError('Message introuvable.');
+    final dataUrl = _text(message['attachmentDataUrl']);
+    final match = RegExp(
+      r'^data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$',
+      caseSensitive: false,
+    ).firstMatch(dataUrl);
+    if (match == null) throw StateError('Image introuvable.');
+    try {
+      return <String, dynamic>{
+        'mimeType': match.group(1)!.toLowerCase(),
+        'bytes': base64Decode(match.group(2)!),
+      };
+    } on FormatException {
+      throw StateError('Image illisible.');
+    }
+  }
+
+  Future<JsonMap> setMessageReaction(
+    String sessionId,
+    String conversationId,
+    String messageId,
+    JsonMap body,
+  ) async {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final target = _messageActionTarget(
+      conversationId,
+      messageId,
+      currentUserId,
+    );
+    final emoji = _validReactionEmoji(body['emoji']);
+    final reactions = _stringMap(target.message['reactions']);
+    if (reactions[currentUserId] == emoji) {
+      return _messageActionResult(
+        target.message,
+        target.conversation,
+        currentUserId,
+      );
+    }
+    reactions[currentUserId] = emoji;
+    target.message['reactions'] = reactions;
+    _advanceMessageRevision(target.conversation, target.message);
+    target.conversation['messages'] = target.messages;
+    target.conversation['updatedAt'] = _nowIso();
+    _saveMessageActionConversation(target.conversation);
+    _notifySharedChange();
+    await _persist(const StateMutationBatch(messageConversations: true));
+    return _messageActionResult(
+      target.message,
+      target.conversation,
+      currentUserId,
+    );
+  }
+
+  Future<JsonMap> pinMessage(
+    String sessionId,
+    String conversationId,
+    String messageId,
+  ) async {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final target = _messageActionTarget(
+      conversationId,
+      messageId,
+      currentUserId,
+    );
+    if (_text(target.message['pinnedBy']) == currentUserId) {
+      return _messageActionResult(
+        target.message,
+        target.conversation,
+        currentUserId,
+      );
+    }
+    target.message['pinnedBy'] = currentUserId;
+    target.message['pinnedAt'] = _nowIso();
+    _advanceMessageRevision(target.conversation, target.message);
+    target.conversation['messages'] = target.messages;
+    target.conversation['updatedAt'] = _nowIso();
+    _saveMessageActionConversation(target.conversation);
+    _notifySharedChange();
+    await _persist(const StateMutationBatch(messageConversations: true));
+    return _messageActionResult(
+      target.message,
+      target.conversation,
+      currentUserId,
+    );
+  }
+
+  Future<JsonMap> unpinMessage(
+    String sessionId,
+    String conversationId,
+    String messageId,
+  ) async {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final target = _messageActionTarget(
+      conversationId,
+      messageId,
+      currentUserId,
+    );
+    if (_text(target.message['pinnedBy']).isEmpty) {
+      return _messageActionResult(
+        target.message,
+        target.conversation,
+        currentUserId,
+      );
+    }
+    final tripOwnerUserId = _tripOwnerUserIdForConversation(
+      target.conversation,
+    );
+    if (_text(target.message['pinnedBy']) != currentUserId &&
+        tripOwnerUserId != currentUserId) {
+      throw StateError(
+        'Seul l’auteur de l’épingle ou l’Étoile du trajet peut la retirer.',
+      );
+    }
+    target.message
+      ..remove('pinnedBy')
+      ..remove('pinnedAt');
+    _advanceMessageRevision(target.conversation, target.message);
+    target.conversation['messages'] = target.messages;
+    target.conversation['updatedAt'] = _nowIso();
+    _saveMessageActionConversation(target.conversation);
+    _notifySharedChange();
+    await _persist(const StateMutationBatch(messageConversations: true));
+    return _messageActionResult(
+      target.message,
+      target.conversation,
+      currentUserId,
+    );
+  }
+
+  ({JsonMap conversation, List<JsonMap> messages, JsonMap message})
+  _messageActionTarget(
+    String conversationId,
+    String messageId,
+    String currentUserId,
+  ) {
+    final conversation = _messageConversationForParticipant(
+      conversationId,
+      currentUserId,
+    );
+    if (conversation == null) throw StateError('Conversation introuvable.');
+    if (_text(conversation['kind']) != 'trip') {
+      throw StateError('Cette action est réservée aux discussions de groupe.');
+    }
+    final normalizedMessageId = messageId.trim();
+    if (normalizedMessageId.isEmpty) {
+      throw StateError('Identifiant de message invalide.');
+    }
+    final messages = _mapList(conversation['messages']);
+    final message = messages.firstWhere(
+      (item) => _text(item['id']) == normalizedMessageId,
+      orElse: () => <String, dynamic>{},
+    );
+    if (message.isEmpty) throw StateError('Message introuvable.');
+    return (conversation: conversation, messages: messages, message: message);
+  }
+
+  String _tripOwnerUserIdForConversation(JsonMap conversation) {
+    final storedOwnerId = _text(conversation['tripOwnerUserId']);
+    if (storedOwnerId.isNotEmpty) return storedOwnerId;
+    final tripId = _text(conversation['tripId']);
+    for (final trip in _trips()) {
+      if (_text(trip['id']) == tripId) {
+        return _tripConversationOwnerUserId(trip);
+      }
+    }
+    return '';
+  }
+
+  void _saveMessageActionConversation(JsonMap updatedConversation) {
+    final conversations = _messageConversations();
+    final index = conversations.indexWhere(
+      (conversation) =>
+          _text(conversation['id']) == _text(updatedConversation['id']),
+    );
+    if (index < 0) throw StateError('Conversation introuvable.');
+    conversations[index] = updatedConversation;
+    _state['messageConversations'] = conversations;
+  }
+
+  void _advanceMessageRevision(JsonMap conversation, JsonMap message) {
+    final nextRevision =
+        math.max(
+          _int(conversation['messageRevision']),
+          _mapList(conversation['messages']).fold<int>(
+            0,
+            (max, item) => math.max(max, _int(item['updateRevision'])),
+          ),
+        ) +
+        1;
+    message['updateRevision'] = nextRevision;
+    conversation['messageRevision'] = nextRevision;
+  }
+
+  JsonMap _messageActionResult(
+    JsonMap message,
+    JsonMap conversation,
+    String currentUserId,
+  ) {
+    final tripOwnerUserId = _tripOwnerUserIdForConversation(conversation);
+    return <String, dynamic>{
+      'message': _publicMessageItem(
+        message,
+        currentUserId: currentUserId,
+        tripOwnerUserId: tripOwnerUserId,
+      ),
+      'conversation': _publicMessageConversation(
+        conversation,
+        currentUserId: currentUserId,
+        usersById: _usersById(),
+      ),
+    };
+  }
+
+  String _validReactionEmoji(Object? value) {
+    final emoji = _text(value).trim();
+    if (emoji.isEmpty || emoji.runes.length > 16) {
+      throw StateError('Réaction emoji invalide.');
+    }
+    final runes = emoji.runes.toList(growable: false);
+    final emojiBases = runes.where(_isEmojiBaseCodePoint).toList();
+    final hasEmojiBase = emojiBases.isNotEmpty;
+    final isRegionalFlag =
+        emojiBases.length == 2 &&
+        emojiBases.every((rune) => rune >= 0x1f1e6 && rune <= 0x1f1ff);
+    final isJoinedEmoji = runes.contains(0x200d) && emojiBases.length > 1;
+    final isSingleEmoji = emojiBases.length == 1 || isRegionalFlag;
+    final hasKeycapBase = emojiBases.any(
+      (rune) => (rune >= 0x30 && rune <= 0x39) || rune == 0x23 || rune == 0x2a,
+    );
+    final allAllowed = runes.every(
+      (rune) =>
+          _isEmojiBaseCodePoint(rune) ||
+          rune == 0x200d ||
+          rune == 0x20e3 ||
+          rune == 0xfe0e ||
+          rune == 0xfe0f ||
+          (rune >= 0x1f3fb && rune <= 0x1f3ff) ||
+          (rune >= 0xe0020 && rune <= 0xe007f),
+    );
+    final validCluster =
+        isSingleEmoji || (isJoinedEmoji && emojiBases.length <= 16);
+    if (!hasEmojiBase ||
+        !allAllowed ||
+        !validCluster ||
+        (hasKeycapBase && !runes.contains(0x20e3))) {
+      throw StateError('Réaction emoji invalide.');
+    }
+    return emoji;
+  }
+
+  bool _isEmojiBaseCodePoint(int rune) {
+    return rune == 0x00a9 ||
+        rune == 0x00ae ||
+        (rune >= 0x203c && rune <= 0x3299) ||
+        (rune >= 0x1f000 && rune <= 0x1faff) ||
+        (rune >= 0x2600 && rune <= 0x27bf) ||
+        (rune >= 0x30 && rune <= 0x39) ||
+        rune == 0x23 ||
+        rune == 0x2a;
+  }
+
+  Map<String, String> _stringMap(Object? raw) {
+    if (raw is! Map) return <String, String>{};
+    return raw.map((key, value) => MapEntry(key.toString(), value.toString()));
   }
 
   Future<JsonMap> markMessageConversationRead(
@@ -2337,9 +2675,7 @@ class PiwibusStore {
       currentReceiptSequence,
       throughSequence,
     );
-    final deliveredSequences = _sequenceMap(
-      conversation['deliveredSequences'],
-    );
+    final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
     deliveredSequences[currentUserId] = math.max(
       deliveredSequences[currentUserId] ?? 0,
       throughSequence,
@@ -2383,9 +2719,7 @@ class PiwibusStore {
     if (throughSequence <= 0) {
       return <String, dynamic>{'conversationId': conversationId, 'ok': true};
     }
-    final deliveredSequences = _sequenceMap(
-      conversation['deliveredSequences'],
-    );
+    final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
     if (throughSequence <= (deliveredSequences[currentUserId] ?? 0)) {
       return <String, dynamic>{'conversationId': conversationId, 'ok': true};
     }
@@ -4192,9 +4526,7 @@ class PiwibusStore {
     final readReceiptSequences = _sequenceMap(
       conversation['readReceiptSequences'],
     );
-    final deliveredSequences = _sequenceMap(
-      conversation['deliveredSequences'],
-    );
+    final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
     final otherParticipantIds = participantIds
         .where((id) => id != currentUserId)
         .toList(growable: false);
@@ -4222,6 +4554,19 @@ class PiwibusStore {
         : kind == 'direct' && peerUser != null
         ? _text(peerUser['fullName'])
         : 'Conversation trajet';
+    final tripOwnerUserId = _tripOwnerUserIdForConversation(conversation);
+    final pinnedMessages = kind == 'trip'
+        ? _mapList(conversation['messages'])
+              .where((message) => _text(message['pinnedBy']).isNotEmpty)
+              .map(
+                (message) => _publicMessageItem(
+                  message,
+                  currentUserId: currentUserId,
+                  tripOwnerUserId: tripOwnerUserId,
+                ),
+              )
+              .toList(growable: false)
+        : const <JsonMap>[];
     return <String, dynamic>{
       'id': _text(conversation['id']),
       'kind': kind,
@@ -4243,8 +4588,10 @@ class PiwibusStore {
         'lastSenderId': _text(conversation['lastSenderId']),
       'unreadCount': unreadCount,
       'messageCursor': _int(conversation['messageCursor']),
+      'messageRevision': _int(conversation['messageRevision']),
       'deliveredThrough': deliveredThrough,
       'readThrough': recipientReadThrough,
+      'pinnedMessages': pinnedMessages,
       'createdAt': _text(conversation['createdAt']),
       'updatedAt': _text(conversation['updatedAt']),
     };
@@ -4267,8 +4614,20 @@ class PiwibusStore {
 
   JsonMap _publicMessageItem(
     JsonMap message, {
+    String currentUserId = '',
+    String tripOwnerUserId = '',
     String deliveryState = 'sent',
   }) {
+    final reactionsByUser = _stringMap(message['reactions']);
+    final reactionsByEmoji = <String, int>{};
+    for (final emoji in reactionsByUser.values) {
+      reactionsByEmoji.update(emoji, (count) => count + 1, ifAbsent: () => 1);
+    }
+    final replyTo = message['replyTo'];
+    final replyToMap = replyTo is Map
+        ? Map<String, dynamic>.from(replyTo)
+        : const <String, dynamic>{};
+    final pinnedBy = _text(message['pinnedBy']);
     return <String, dynamic>{
       'id': _text(message['id']),
       'conversationId': _text(
@@ -4278,8 +4637,35 @@ class PiwibusStore {
       'senderName': _text(message['senderName'] ?? message['sender_name']),
       'body': _text(message['body']),
       'sequence': _int(message['sequence']),
+      'updateRevision': _int(message['updateRevision']),
       'createdAt': _text(message['createdAt'] ?? message['created_at']),
       'deliveryState': deliveryState,
+      if (_text(message['attachmentDataUrl']).isNotEmpty) ...<String, dynamic>{
+        'attachmentUrl':
+            '/messages/conversations/${Uri.encodeComponent(_text(message['conversationId'] ?? message['conversation_id']))}/messages/${Uri.encodeComponent(_text(message['id']))}/attachment',
+        'attachmentMimeType': _text(message['attachmentMimeType']),
+      },
+      if (replyToMap.isNotEmpty)
+        'replyTo': <String, dynamic>{
+          'messageId': _text(replyToMap['messageId']),
+          'senderName': _text(replyToMap['senderName']),
+          'excerpt': _text(replyToMap['excerpt']),
+        },
+      'reactions': reactionsByEmoji.entries
+          .map(
+            (entry) => <String, dynamic>{
+              'emoji': entry.key,
+              'count': entry.value,
+              'reactedByMe': reactionsByUser[currentUserId] == entry.key,
+            },
+          )
+          .toList(growable: false),
+      if (pinnedBy.isNotEmpty) ...<String, dynamic>{
+        'pinnedBy': pinnedBy,
+        'pinnedAt': _text(message['pinnedAt']),
+        'canUnpin':
+            pinnedBy == currentUserId || tripOwnerUserId == currentUserId,
+      },
     };
   }
 
@@ -5143,6 +5529,9 @@ class PiwibusStore {
       'kind': _text(input['kind']).isEmpty ? 'direct' : _text(input['kind']),
       'participantIds': participantIds,
       'tripId': _nullableText(input['tripId'] ?? input['trip_id']),
+      'tripOwnerUserId': _nullableText(
+        input['tripOwnerUserId'] ?? input['trip_owner_user_id'],
+      ),
       'title': _text(input['title']),
       'subtitle': _text(input['subtitle']),
       'lastMessagePreview': _text(
@@ -5155,6 +5544,9 @@ class PiwibusStore {
         input['lastSenderId'] ?? input['last_sender_id'],
       ),
       'messageCursor': messageCursor,
+      'messageRevision': _int(
+        input['messageRevision'] ?? input['message_revision'],
+      ),
       'readSequences': _sequenceMap(
         input['readSequences'] ?? input['read_sequences'],
       ),
@@ -5182,6 +5574,10 @@ class PiwibusStore {
     final body = _text(
       input['body'] ?? input['content'] ?? input['ciphertext'],
     );
+    final replyToRaw = input['replyTo'] ?? input['reply_to'];
+    final replyTo = replyToRaw is Map
+        ? Map<String, dynamic>.from(replyToRaw)
+        : const <String, dynamic>{};
     return <String, dynamic>{
       'id': _text(input['id'] ?? input['messageId'] ?? input['message_id']),
       'conversationId': _text(
@@ -5191,7 +5587,33 @@ class PiwibusStore {
       'senderName': _text(input['senderName'] ?? input['sender_name']),
       'body': body,
       'sequence': _int(input['sequence'] ?? input['message_order']),
+      'updateRevision': _int(
+        input['updateRevision'] ?? input['update_revision'],
+      ),
       'createdAt': _dateValue(input['createdAt'] ?? input['created_at']),
+      if (_text(
+        input['attachmentDataUrl'] ?? input['attachment_data_url'],
+      ).isNotEmpty)
+        'attachmentDataUrl': _text(
+          input['attachmentDataUrl'] ?? input['attachment_data_url'],
+        ),
+      if (_text(
+        input['attachmentMimeType'] ?? input['attachment_mime_type'],
+      ).isNotEmpty)
+        'attachmentMimeType': _text(
+          input['attachmentMimeType'] ?? input['attachment_mime_type'],
+        ),
+      if (_text(replyTo['messageId'] ?? replyTo['message_id']).isNotEmpty)
+        'replyTo': <String, dynamic>{
+          'messageId': _text(replyTo['messageId'] ?? replyTo['message_id']),
+          'senderName': _text(replyTo['senderName'] ?? replyTo['sender_name']),
+          'excerpt': _messagePreview(_text(replyTo['excerpt'])),
+        },
+      'reactions': _stringMap(input['reactions']),
+      if (_text(input['pinnedBy'] ?? input['pinned_by']).isNotEmpty)
+        'pinnedBy': _text(input['pinnedBy'] ?? input['pinned_by']),
+      if (_text(input['pinnedAt'] ?? input['pinned_at']).isNotEmpty)
+        'pinnedAt': _text(input['pinnedAt'] ?? input['pinned_at']),
     };
   }
 
@@ -6710,6 +7132,7 @@ class PiwibusStore {
     if (match == null) {
       throw StateError('Photo de profil invalide.');
     }
+
     try {
       final bytes = base64Decode(
         match.group(2)!.replaceAll(RegExp(r'\s+'), ''),
@@ -6721,6 +7144,63 @@ class PiwibusStore {
       throw StateError('Photo de profil invalide.');
     }
     return text;
+  }
+
+  String? _messageAttachmentDataUrlFrom(Object? value) {
+    final dataUrl = _boundedText(
+      value,
+      _maxMessageAttachmentDataUrlLength,
+      fieldName: 'Image du message',
+    );
+    if (dataUrl.isEmpty) return null;
+    final match = RegExp(
+      r'^data:(image/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=\r\n]+)$',
+      caseSensitive: false,
+    ).firstMatch(dataUrl);
+    if (match == null) {
+      throw const FormatException(
+        'Le format de l’image du message est invalide.',
+      );
+    }
+    try {
+      final bytes = base64Decode(
+        match.group(2)!.replaceAll(RegExp(r'\s+'), ''),
+      );
+      if (bytes.isEmpty || bytes.length > _maxMessageAttachmentBytes) {
+        throw const FormatException(
+          'L’image du message doit faire 256 Ko maximum.',
+        );
+      }
+      final mimeType = match
+          .group(1)!
+          .toLowerCase()
+          .replaceFirst('jpg', 'jpeg');
+      final validSignature = switch (mimeType) {
+        'image/png' =>
+          bytes.length >= 8 &&
+              bytes[0] == 0x89 &&
+              bytes[1] == 0x50 &&
+              bytes[2] == 0x4e &&
+              bytes[3] == 0x47,
+        'image/jpeg' =>
+          bytes.length >= 3 &&
+              bytes[0] == 0xff &&
+              bytes[1] == 0xd8 &&
+              bytes[2] == 0xff,
+        'image/webp' =>
+          bytes.length >= 12 &&
+              ascii.decode(bytes.sublist(0, 4), allowInvalid: true) == 'RIFF' &&
+              ascii.decode(bytes.sublist(8, 12), allowInvalid: true) == 'WEBP',
+        _ => false,
+      };
+      if (!validSignature) {
+        throw const FormatException('Le contenu de l’image est invalide.');
+      }
+      return 'data:$mimeType;base64,${base64Encode(bytes)}';
+    } on FormatException catch (error) {
+      if (error.message.contains('256 Ko')) rethrow;
+      throw const FormatException('Les données de l’image sont invalides.');
+    }
   }
 
   static double _distanceMeters(

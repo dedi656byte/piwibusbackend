@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -240,6 +241,225 @@ void main() {
       },
     );
 
+    test(
+      'trip message actions are shared, authorized, and persisted',
+      () async {
+        final tempDir = await Directory.systemTemp.createTemp(
+          'piwibus-message-actions',
+        );
+        final stateFile = File(p.join(tempDir.path, 'state.json'));
+        var store = await PiwibusStore.openWithPersistence(
+          JsonFileStatePersistence(stateFile),
+        );
+        addTearDown(() async {
+          await store.close();
+          if (tempDir.existsSync()) {
+            await tempDir.delete(recursive: true);
+          }
+        });
+
+        final line = store.lines().first;
+        final tripId = 'trip-message-actions';
+        for (final user
+            in <({String sessionId, String fullName, String email})>[
+              (
+                sessionId: 'actions-owner',
+                fullName: 'Trip Owner',
+                email: 'actions-owner@example.com',
+              ),
+              (
+                sessionId: 'actions-bob',
+                fullName: 'Bob',
+                email: 'actions-bob@example.com',
+              ),
+              (
+                sessionId: 'actions-charlie',
+                fullName: 'Charlie',
+                email: 'actions-charlie@example.com',
+              ),
+              (
+                sessionId: 'actions-outsider',
+                fullName: 'Outsider',
+                email: 'actions-outsider@example.com',
+              ),
+            ]) {
+          await store.register(user.sessionId, <String, dynamic>{
+            'fullName': user.fullName,
+            'email': user.email,
+            'password': 'password123',
+          });
+        }
+        await store.startTrip('actions-owner', <String, dynamic>{
+          'tripId': tripId,
+          'lineCode': _string(line['code']),
+          'liveLocation': _routePointLocation(line),
+        });
+        await store.selectTrip('actions-bob', tripId);
+        await store.selectTrip('actions-charlie', tripId);
+
+        final groupConversation = store
+            .messageConversationsForSession('actions-bob')
+            .firstWhere((item) => item['kind'] == 'trip');
+        final conversationId = _string(groupConversation['id']);
+        final firstMessage = await store.sendMessageItem(
+          'actions-bob',
+          conversationId,
+          <String, dynamic>{'body': 'Message à annoter'},
+        );
+        final firstMessageId = _string((firstMessage['message'] as Map)['id']);
+        final reply = await store.sendMessageItem(
+          'actions-charlie',
+          conversationId,
+          <String, dynamic>{
+            'body': 'Réponse citée',
+            'replyToMessageId': firstMessageId,
+          },
+        );
+        final replyMessageId = _string((reply['message'] as Map)['id']);
+        expect((reply['message'] as Map)['replyTo'], <String, dynamic>{
+          'messageId': firstMessageId,
+          'senderName': 'Bob',
+          'excerpt': 'Message à annoter',
+        });
+
+        await store.setMessageReaction(
+          'actions-bob',
+          conversationId,
+          firstMessageId,
+          <String, dynamic>{'emoji': '👍'},
+        );
+        await store.setMessageReaction(
+          'actions-charlie',
+          conversationId,
+          firstMessageId,
+          <String, dynamic>{'emoji': '👍'},
+        );
+        var bobFirstMessage = store
+            .conversationMessages('actions-bob', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(bobFirstMessage['reactions'], <Map<String, dynamic>>[
+          <String, dynamic>{'emoji': '👍', 'count': 2, 'reactedByMe': true},
+        ]);
+        expect(bobFirstMessage.containsKey('reactionsByUser'), isFalse);
+        expect(
+          store.conversationMessages(
+            'actions-bob',
+            conversationId,
+            afterRevision: 1,
+          ),
+          isNotEmpty,
+        );
+
+        await store.setMessageReaction(
+          'actions-charlie',
+          conversationId,
+          firstMessageId,
+          <String, dynamic>{'emoji': '❤️'},
+        );
+        await store.setMessageReaction(
+          'actions-charlie',
+          conversationId,
+          firstMessageId,
+          <String, dynamic>{'emoji': '❤️'},
+        );
+        bobFirstMessage = store
+            .conversationMessages('actions-bob', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(
+          (bobFirstMessage['reactions'] as List)
+              .map((item) => (item as Map)['count'])
+              .toList(),
+          <int>[1, 1],
+        );
+
+        await store.pinMessage('actions-bob', conversationId, firstMessageId);
+        await store.pinMessage(
+          'actions-charlie',
+          conversationId,
+          replyMessageId,
+        );
+        await expectLater(
+          store.unpinMessage('actions-charlie', conversationId, firstMessageId),
+          throwsStateError,
+        );
+        final publicConversation = store.messageConversationsForSession(
+          'actions-outsider',
+        );
+        expect(publicConversation, isEmpty);
+        final bobConversation = store
+            .messageConversationsForSession('actions-bob')
+            .firstWhere((item) => item['id'] == conversationId);
+        expect(bobConversation['pinnedMessages'], hasLength(2));
+        await expectLater(
+          store.setMessageReaction(
+            'actions-outsider',
+            conversationId,
+            firstMessageId,
+            <String, dynamic>{'emoji': '😂'},
+          ),
+          throwsStateError,
+        );
+        await expectLater(
+          store.setMessageReaction(
+            'actions-bob',
+            conversationId,
+            firstMessageId,
+            <String, dynamic>{'emoji': 'not-an-emoji'},
+          ),
+          throwsStateError,
+        );
+        await expectLater(
+          store.setMessageReaction(
+            'actions-bob',
+            conversationId,
+            firstMessageId,
+            <String, dynamic>{'emoji': '👍❤️'},
+          ),
+          throwsStateError,
+        );
+
+        final direct = await store.startMessageConversation(
+          'actions-bob',
+          <String, dynamic>{
+            'peerUserId':
+                (store.snapshot('actions-charlie')['currentUser'] as Map)['id'],
+          },
+        );
+        final directId = _string((direct['conversation'] as Map)['id']);
+        await expectLater(
+          store.setMessageReaction(
+            'actions-bob',
+            directId,
+            firstMessageId,
+            <String, dynamic>{'emoji': '👍'},
+          ),
+          throwsStateError,
+        );
+
+        await store.close();
+        store = await PiwibusStore.openWithPersistence(
+          JsonFileStatePersistence(stateFile),
+        );
+        final reloadedMessage = store
+            .conversationMessages('actions-bob', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(reloadedMessage['reactions'], hasLength(2));
+        final reloadedReply = store
+            .conversationMessages('actions-charlie', conversationId)
+            .firstWhere((item) => item['id'] == replyMessageId);
+        expect((reloadedReply['replyTo'] as Map)['messageId'], firstMessageId);
+        final reloadedConversation = store
+            .messageConversationsForSession('actions-bob')
+            .firstWhere((item) => item['id'] == conversationId);
+        expect(reloadedConversation['pinnedMessages'], hasLength(2));
+        await store.unpinMessage(
+          'actions-owner',
+          conversationId,
+          firstMessageId,
+        );
+      },
+    );
+
     test('nearby message peers are compact and limited by default', () async {
       final store = await _openTempStore('piwibus-peer-candidates');
       final line = store.lines().first;
@@ -282,6 +502,106 @@ void main() {
       expect(user.containsKey('phone'), isFalse);
       expect(user.containsKey('readAlertIds'), isFalse);
       expect(user.containsKey('profilePhotoDataUrl'), isFalse);
+    });
+
+    test('message images are private and retryable by message ID', () async {
+      final tempDir = Directory.systemTemp.createTempSync(
+        'piwibus-message-image',
+      );
+      addTearDown(() async {
+        if (tempDir.existsSync()) await tempDir.delete(recursive: true);
+      });
+      final stateFile = File(p.join(tempDir.path, 'state.json'));
+      var store = await PiwibusStore.openWithPersistence(
+        JsonFileStatePersistence(stateFile),
+      );
+      final line = store.lines().first;
+      final tripId = 'trip-message-image';
+      await store.register('image-owner', <String, dynamic>{
+        'fullName': 'Image Owner',
+        'email': 'image-owner@example.com',
+        'password': 'password123',
+      });
+      await store.register('image-sender', <String, dynamic>{
+        'fullName': 'Image Sender',
+        'email': 'image-sender@example.com',
+        'password': 'password123',
+      });
+      await store.register('image-outsider', <String, dynamic>{
+        'fullName': 'Image Outsider',
+        'email': 'image-outsider@example.com',
+        'password': 'password123',
+      });
+      await store.startTrip('image-owner', <String, dynamic>{
+        'tripId': tripId,
+        'lineCode': _string(line['code']),
+        'liveLocation': _routePointLocation(line),
+      });
+      await store.selectTrip('image-sender', tripId);
+      final conversation = store
+          .messageConversationsForSession('image-sender')
+          .firstWhere((item) => item['kind'] == 'trip');
+      final conversationId = _string(conversation['id']);
+
+      final sent = await store
+          .sendMessageItem('image-sender', conversationId, <String, dynamic>{
+            'body': '',
+            'messageId': 'message-with-image',
+            'attachmentDataUrl': _tinyPngDataUrl,
+          });
+      final message = sent['message'] as Map<String, dynamic>;
+      expect(message['body'], '');
+      expect(message['attachmentMimeType'], 'image/png');
+      expect(message['attachmentUrl'], contains('/attachment'));
+      expect(message.containsKey('attachmentDataUrl'), isFalse);
+
+      final repeated = await store
+          .sendMessageItem('image-sender', conversationId, <String, dynamic>{
+            'body': '',
+            'messageId': 'message-with-image',
+            'attachmentDataUrl': _tinyPngDataUrl,
+          });
+      expect((repeated['message'] as Map)['id'], 'message-with-image');
+      final attachment = store.messageAttachment(
+        'image-sender',
+        conversationId,
+        'message-with-image',
+      );
+      expect(attachment['mimeType'], 'image/png');
+      expect(
+        attachment['bytes'],
+        base64Decode(_tinyPngDataUrl.split(',').last),
+      );
+      expect(
+        () => store.messageAttachment(
+          'image-outsider',
+          conversationId,
+          'message-with-image',
+        ),
+        throwsStateError,
+      );
+      await expectLater(
+        store.sendMessageItem('image-sender', conversationId, <String, dynamic>{
+          'body': '',
+          'messageId': 'oversized-message-image',
+          'attachmentDataUrl':
+              'data:image/png;base64,${base64Encode(List<int>.filled(256 * 1024 + 1, 0))}',
+        }),
+        throwsFormatException,
+      );
+      await store.close();
+      store = await PiwibusStore.openWithPersistence(
+        JsonFileStatePersistence(stateFile),
+      );
+      final restoredAttachment = store.messageAttachment(
+        'image-sender',
+        conversationId,
+        'message-with-image',
+      );
+      expect(
+        restoredAttachment['bytes'],
+        base64Decode(_tinyPngDataUrl.split(',').last),
+      );
     });
   });
 }

@@ -911,6 +911,11 @@ Future<void> main(List<String> args) async {
             query['afterSequence'] ?? query['after_sequence'] ?? '',
           ) ??
           0;
+      final afterRevision =
+          int.tryParse(
+            query['afterRevision'] ?? query['after_revision'] ?? '',
+          ) ??
+          0;
       final beforeSequence =
           int.tryParse(
             query['beforeSequence'] ?? query['before_sequence'] ?? '',
@@ -922,10 +927,33 @@ Future<void> main(List<String> args) async {
           sessionId,
           id,
           afterSequence: afterSequence,
+          afterRevision: afterRevision,
           beforeSequence: beforeSequence,
           limit: limit,
         ),
       });
+    } catch (error) {
+      return _errorForException(error);
+    }
+  });
+
+  router.get('/messages/conversations/<id>/messages/<messageId>/attachment', (
+    Request request,
+    String id,
+    String messageId,
+  ) async {
+    try {
+      final sessionId = await sessionIdFor(request);
+      final attachment = store.messageAttachment(sessionId, id, messageId);
+      final mimeType = _string(attachment['mimeType']);
+      return Response.ok(
+        Stream<List<int>>.value(List<int>.from(attachment['bytes'] as List)),
+        headers: <String, String>{
+          HttpHeaders.contentTypeHeader: mimeType,
+          HttpHeaders.cacheControlHeader: 'private, no-store',
+          'x-content-type-options': 'nosniff',
+        },
+      );
     } catch (error) {
       return _errorForException(error);
     }
@@ -938,7 +966,7 @@ Future<void> main(List<String> args) async {
     final sessionId = await sessionIdFor(request);
     final compact = _compactResponseRequested(request);
     try {
-      final body = await _readJson(request);
+      final body = await _readJson(request, maxBytes: 400 * 1024);
       final result = await store.sendMessageItem(sessionId, id, body);
       final message = result['message'] is Map
           ? Map<String, dynamic>.from(result['message'] as Map)
@@ -1003,6 +1031,45 @@ Future<void> main(List<String> args) async {
       request,
       jwtCodec,
       (body) => store.markMessageConversationRead(sessionId, id, body),
+    );
+  });
+
+  router.put('/messages/conversations/<id>/messages/<messageId>/reaction', (
+    Request request,
+    String id,
+    String messageId,
+  ) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(
+      request,
+      jwtCodec,
+      (body) => store.setMessageReaction(sessionId, id, messageId, body),
+    );
+  });
+
+  router.post('/messages/conversations/<id>/messages/<messageId>/pin', (
+    Request request,
+    String id,
+    String messageId,
+  ) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(
+      request,
+      jwtCodec,
+      (_) => store.pinMessage(sessionId, id, messageId),
+    );
+  });
+
+  router.delete('/messages/conversations/<id>/messages/<messageId>/pin', (
+    Request request,
+    String id,
+    String messageId,
+  ) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(
+      request,
+      jwtCodec,
+      (_) => store.unpinMessage(sessionId, id, messageId),
     );
   });
 
@@ -1269,11 +1336,14 @@ Future<Response> _handleJson(
   }
 }
 
-Future<JsonMap> _readJson(Request request) async {
+Future<JsonMap> _readJson(
+  Request request, {
+  int maxBytes = _maxJsonBodyBytes,
+}) async {
   final declaredLength = int.tryParse(
     request.headers[HttpHeaders.contentLengthHeader] ?? '',
   );
-  if (declaredLength != null && declaredLength > _maxJsonBodyBytes) {
+  if (declaredLength != null && declaredLength > maxBytes) {
     throw const FormatException('Le corps JSON est trop volumineux.');
   }
 
@@ -1281,7 +1351,7 @@ Future<JsonMap> _readJson(Request request) async {
   var totalBytes = 0;
   await for (final chunk in request.read()) {
     totalBytes += chunk.length;
-    if (totalBytes > _maxJsonBodyBytes) {
+    if (totalBytes > maxBytes) {
       throw const FormatException('Le corps JSON est trop volumineux.');
     }
     bytes.add(chunk);

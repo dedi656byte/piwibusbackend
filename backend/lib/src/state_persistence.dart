@@ -410,7 +410,9 @@ class PostgresStatePersistence extends StatePersistence {
       final messageRows = await connection.execute('''
       SELECT
         conversation_id, message_id, message_order, sender_id, sender_name,
-        body, sequence, created_at
+        body, sequence, update_revision, created_at, reply_to_message_id,
+        reply_to_sender_name, reply_to_excerpt, reactions, pinned_by, pinned_at,
+        attachment_data_url, attachment_mime_type
       FROM piwibus_message_items
       ORDER BY conversation_id ASC, sequence ASC, created_at ASC, message_id ASC
     ''');
@@ -427,13 +429,28 @@ class PostgresStatePersistence extends StatePersistence {
               'senderName': _text(map['sender_name']),
               'body': _text(map['body']),
               'sequence': _int(map['sequence']),
+              'updateRevision': _int(map['update_revision']),
               'createdAt': _iso(map['created_at']),
+              if (_text(map['reply_to_message_id']).isNotEmpty)
+                'replyTo': <String, dynamic>{
+                  'messageId': _text(map['reply_to_message_id']),
+                  'senderName': _text(map['reply_to_sender_name']),
+                  'excerpt': _text(map['reply_to_excerpt']),
+                },
+              'reactions':
+                  _jsonMapOrNull(map['reactions']) ?? const <String, dynamic>{},
+              'pinnedBy': _text(map['pinned_by']),
+              'pinnedAt': _iso(map['pinned_at']),
+              'attachmentDataUrl': _text(map['attachment_data_url']),
+              'attachmentMimeType': _text(map['attachment_mime_type']),
             });
       }
 
       final messageConversationRows = await connection.execute('''
       SELECT
-        id, sort_order, kind, participant_ids, trip_id, title, subtitle,
+        id, sort_order, kind, participant_ids, trip_id, trip_owner_user_id,
+        message_revision,
+        title, subtitle,
         last_message_preview, last_message_id, last_sender_id, message_cursor,
         read_sequences, read_receipt_sequences, delivered_sequences,
         created_at, updated_at
@@ -449,6 +466,8 @@ class PostgresStatePersistence extends StatePersistence {
               'kind': _text(map['kind']),
               'participantIds': _sqlStringList(map['participant_ids']),
               'tripId': _text(map['trip_id']),
+              'tripOwnerUserId': _text(map['trip_owner_user_id']),
+              'messageRevision': _int(map['message_revision']),
               'title': _text(map['title']),
               'subtitle': _text(map['subtitle']),
               'lastMessagePreview': _text(map['last_message_preview']),
@@ -1091,15 +1110,17 @@ class PostgresStatePersistence extends StatePersistence {
         await session.execute(
           Sql.named('''
             INSERT INTO piwibus_message_conversations (
-              id, sort_order, kind, participant_ids, trip_id, title, subtitle,
+              id, sort_order, kind, participant_ids, trip_id,
+              trip_owner_user_id, message_revision, title, subtitle,
               last_message_preview, last_message_id, last_sender_id,
               message_cursor, read_sequences, read_receipt_sequences,
               delivered_sequences,
               created_at, updated_at
             )
             VALUES (
-              @id, @sort_order, @kind, @participant_ids, @trip_id, @title,
-              @subtitle, @last_message_preview, @last_message_id,
+              @id, @sort_order, @kind, @participant_ids, @trip_id,
+              @trip_owner_user_id, @message_revision, @title, @subtitle,
+              @last_message_preview, @last_message_id,
               @last_sender_id, @message_cursor, @read_sequences::jsonb,
               @read_receipt_sequences::jsonb,
               @delivered_sequences::jsonb,
@@ -1110,6 +1131,8 @@ class PostgresStatePersistence extends StatePersistence {
               kind = EXCLUDED.kind,
               participant_ids = EXCLUDED.participant_ids,
               trip_id = EXCLUDED.trip_id,
+              trip_owner_user_id = EXCLUDED.trip_owner_user_id,
+              message_revision = EXCLUDED.message_revision,
               title = EXCLUDED.title,
               subtitle = EXCLUDED.subtitle,
               last_message_preview = EXCLUDED.last_message_preview,
@@ -1128,6 +1151,8 @@ class PostgresStatePersistence extends StatePersistence {
             'kind': _text(row['kind']).isEmpty ? 'direct' : _text(row['kind']),
             'participant_ids': _stringList(row['participantIds']),
             'trip_id': _nullableText(row['tripId']),
+            'trip_owner_user_id': _nullableText(row['tripOwnerUserId']),
+            'message_revision': _int(row['messageRevision']),
             'title': _text(row['title']),
             'subtitle': _text(row['subtitle']),
             'last_message_preview': _text(row['lastMessagePreview']),
@@ -1160,11 +1185,17 @@ class PostgresStatePersistence extends StatePersistence {
           Sql.named('''
             INSERT INTO piwibus_message_items (
               conversation_id, message_id, message_order, sender_id,
-              sender_name, body, sequence, created_at
+              sender_name, body, sequence, update_revision, created_at,
+              reply_to_message_id,
+              reply_to_sender_name, reply_to_excerpt, reactions, pinned_by,
+              pinned_at, attachment_data_url, attachment_mime_type
             )
             VALUES (
               @conversation_id, @message_id, @message_order, @sender_id,
-              @sender_name, @body, @sequence, @created_at
+              @sender_name, @body, @sequence, @update_revision, @created_at,
+              @reply_to_message_id, @reply_to_sender_name, @reply_to_excerpt,
+              @reactions::jsonb, @pinned_by, @pinned_at,
+              @attachment_data_url, @attachment_mime_type
             )
             ON CONFLICT (conversation_id, message_id) DO UPDATE SET
               message_order = EXCLUDED.message_order,
@@ -1172,7 +1203,16 @@ class PostgresStatePersistence extends StatePersistence {
               sender_name = EXCLUDED.sender_name,
               body = EXCLUDED.body,
               sequence = EXCLUDED.sequence,
-              created_at = EXCLUDED.created_at
+              update_revision = EXCLUDED.update_revision,
+              created_at = EXCLUDED.created_at,
+              reply_to_message_id = EXCLUDED.reply_to_message_id,
+              reply_to_sender_name = EXCLUDED.reply_to_sender_name,
+              reply_to_excerpt = EXCLUDED.reply_to_excerpt,
+              reactions = EXCLUDED.reactions,
+              pinned_by = EXCLUDED.pinned_by,
+              pinned_at = EXCLUDED.pinned_at,
+              attachment_data_url = EXCLUDED.attachment_data_url,
+              attachment_mime_type = EXCLUDED.attachment_mime_type
           '''),
           parameters: <String, Object?>{
             'conversation_id': _text(row['conversationId']),
@@ -1182,7 +1222,24 @@ class PostgresStatePersistence extends StatePersistence {
             'sender_name': _text(row['senderName']),
             'body': _text(row['body']),
             'sequence': _int(row['sequence']),
+            'update_revision': _int(row['updateRevision']),
             'created_at': _dateTime(row['createdAt']),
+            'reply_to_message_id': _nullableText(
+              _jsonMapOrNull(row['replyTo'])?['messageId'],
+            ),
+            'reply_to_sender_name': _text(
+              _jsonMapOrNull(row['replyTo'])?['senderName'],
+            ),
+            'reply_to_excerpt': _text(
+              _jsonMapOrNull(row['replyTo'])?['excerpt'],
+            ),
+            'reactions': jsonEncode(row['reactions'] ?? const {}),
+            'pinned_by': _nullableText(row['pinnedBy']),
+            'pinned_at': _text(row['pinnedAt']).isEmpty
+                ? null
+                : _dateTime(row['pinnedAt']),
+            'attachment_data_url': _nullableText(row['attachmentDataUrl']),
+            'attachment_mime_type': _nullableText(row['attachmentMimeType']),
           },
           ignoreRows: true,
         );
@@ -2432,6 +2489,50 @@ class PostgresStatePersistence extends StatePersistence {
         ALTER TABLE piwibus_message_conversations
         ADD COLUMN IF NOT EXISTS read_receipt_sequences jsonb
         NOT NULL DEFAULT '{}'::jsonb
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 20,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_message_conversations
+        ADD COLUMN IF NOT EXISTS trip_owner_user_id text
+        ''',
+        '''
+        ALTER TABLE piwibus_message_items
+        ADD COLUMN IF NOT EXISTS reply_to_message_id text,
+        ADD COLUMN IF NOT EXISTS reply_to_sender_name text NOT NULL DEFAULT '',
+        ADD COLUMN IF NOT EXISTS reply_to_excerpt text NOT NULL DEFAULT '',
+        ADD COLUMN IF NOT EXISTS reactions jsonb NOT NULL DEFAULT '{}'::jsonb,
+        ADD COLUMN IF NOT EXISTS pinned_by text,
+        ADD COLUMN IF NOT EXISTS pinned_at timestamptz
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 21,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_message_conversations
+        ADD COLUMN IF NOT EXISTS message_revision integer NOT NULL DEFAULT 0
+        ''',
+        '''
+        ALTER TABLE piwibus_message_items
+        ADD COLUMN IF NOT EXISTS update_revision integer NOT NULL DEFAULT 0
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 22,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_message_items
+        ADD COLUMN IF NOT EXISTS attachment_data_url text,
+        ADD COLUMN IF NOT EXISTS attachment_mime_type text NOT NULL DEFAULT ''
         ''',
       ],
     );
