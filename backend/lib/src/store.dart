@@ -2286,6 +2286,9 @@ class PiwibusStore {
       if (repliedMessage.isEmpty) {
         throw StateError('Le message cité est introuvable.');
       }
+      if (repliedMessage['isDeleted'] == true) {
+        throw StateError('Impossible de répondre à un message supprimé.');
+      }
       replyTo = <String, dynamic>{
         'messageId': replyToMessageId,
         'senderName': _text(repliedMessage['senderName']),
@@ -2493,19 +2496,87 @@ class PiwibusStore {
     );
   }
 
+  Future<JsonMap> deleteMessage(
+    String sessionId,
+    String conversationId,
+    String messageId,
+  ) async {
+    final currentUserId = _authenticatedUserId(sessionId);
+    final target = _messageActionTarget(
+      conversationId,
+      messageId,
+      currentUserId,
+      allowDeleted: true,
+    );
+    if (_text(target.message['senderId'] ?? target.message['sender_id']) !=
+        currentUserId) {
+      throw StateError('Tu peux uniquement supprimer tes propres messages.');
+    }
+    if (target.message['isDeleted'] != true) {
+      target.message
+        ..['body'] = ''
+        ..['isDeleted'] = true
+        ..['deletedAt'] = _nowIso()
+        ..remove('attachmentDataUrl')
+        ..remove('attachmentMimeType')
+        ..remove('reactions')
+        ..remove('pinnedBy')
+        ..remove('pinnedAt')
+        ..remove('replyTo');
+      var nextRevision = math.max(
+        _int(target.conversation['messageRevision']),
+        target.messages.fold<int>(
+          0,
+          (max, message) => math.max(max, _int(message['updateRevision'])),
+        ),
+      );
+      target.conversation['messages'] = target.messages;
+      for (final message in target.messages) {
+        final replyTo = message['replyTo'];
+        if (replyTo is Map &&
+            _text(replyTo['messageId'] ?? replyTo['message_id']) ==
+                _text(target.message['id'])) {
+          message['replyTo'] = <String, dynamic>{
+            'messageId': _text(target.message['id']),
+            'senderName': _text(target.message['senderName']),
+            'excerpt': 'Message supprimé',
+          };
+          message['updateRevision'] = ++nextRevision;
+        }
+      }
+      target.message['updateRevision'] = ++nextRevision;
+      target.conversation['messageRevision'] = nextRevision;
+      if (_text(target.conversation['lastMessageId']) ==
+          _text(target.message['id'])) {
+        target.conversation['lastMessagePreview'] = 'Message supprimé';
+      }
+      target.conversation['updatedAt'] = _nowIso();
+      _saveMessageActionConversation(target.conversation);
+      _notifySharedChange();
+      await _persist(const StateMutationBatch(messageConversations: true));
+    }
+    return _messageActionResult(
+      target.message,
+      target.conversation,
+      currentUserId,
+    );
+  }
+
   ({JsonMap conversation, List<JsonMap> messages, JsonMap message})
   _messageActionTarget(
     String conversationId,
     String messageId,
-    String currentUserId,
-  ) {
+    String currentUserId, {
+    bool allowDeleted = false,
+  }) {
     final conversation = _messageConversationForParticipant(
       conversationId,
       currentUserId,
     );
     if (conversation == null) throw StateError('Conversation introuvable.');
-    if (_text(conversation['kind']) != 'trip') {
-      throw StateError('Cette action est réservée aux discussions de groupe.');
+    final conversationKind = _text(conversation['kind']);
+    if (conversationKind != 'trip' && conversationKind != 'direct') {
+      throw StateError('Type de conversation invalide.');
     }
     final normalizedMessageId = messageId.trim();
     if (normalizedMessageId.isEmpty) {
@@ -2517,6 +2588,9 @@ class PiwibusStore {
       orElse: () => <String, dynamic>{},
     );
     if (message.isEmpty) throw StateError('Message introuvable.');
+    if (message['isDeleted'] == true && !allowDeleted) {
+      throw StateError('Ce message a été supprimé.');
+    }
     return (conversation: conversation, messages: messages, message: message);
   }
 
@@ -4555,18 +4629,16 @@ class PiwibusStore {
         ? _text(peerUser['fullName'])
         : 'Conversation trajet';
     final tripOwnerUserId = _tripOwnerUserIdForConversation(conversation);
-    final pinnedMessages = kind == 'trip'
-        ? _mapList(conversation['messages'])
-              .where((message) => _text(message['pinnedBy']).isNotEmpty)
-              .map(
-                (message) => _publicMessageItem(
-                  message,
-                  currentUserId: currentUserId,
-                  tripOwnerUserId: tripOwnerUserId,
-                ),
-              )
-              .toList(growable: false)
-        : const <JsonMap>[];
+    final pinnedMessages = _mapList(conversation['messages'])
+        .where((message) => _text(message['pinnedBy']).isNotEmpty)
+        .map(
+          (message) => _publicMessageItem(
+            message,
+            currentUserId: currentUserId,
+            tripOwnerUserId: tripOwnerUserId,
+          ),
+        )
+        .toList(growable: false);
     return <String, dynamic>{
       'id': _text(conversation['id']),
       'kind': kind,
@@ -4628,6 +4700,7 @@ class PiwibusStore {
         ? Map<String, dynamic>.from(replyTo)
         : const <String, dynamic>{};
     final pinnedBy = _text(message['pinnedBy']);
+    final isDeleted = message['isDeleted'] == true;
     return <String, dynamic>{
       'id': _text(message['id']),
       'conversationId': _text(
@@ -4635,32 +4708,36 @@ class PiwibusStore {
       ),
       'senderId': _text(message['senderId'] ?? message['sender_id']),
       'senderName': _text(message['senderName'] ?? message['sender_name']),
-      'body': _text(message['body']),
+      'body': isDeleted ? 'Message supprimé' : _text(message['body']),
+      'isDeleted': isDeleted,
       'sequence': _int(message['sequence']),
       'updateRevision': _int(message['updateRevision']),
       'createdAt': _text(message['createdAt'] ?? message['created_at']),
       'deliveryState': deliveryState,
-      if (_text(message['attachmentDataUrl']).isNotEmpty) ...<String, dynamic>{
+      if (!isDeleted &&
+          _text(message['attachmentDataUrl']).isNotEmpty) ...<String, dynamic>{
         'attachmentUrl':
             '/messages/conversations/${Uri.encodeComponent(_text(message['conversationId'] ?? message['conversation_id']))}/messages/${Uri.encodeComponent(_text(message['id']))}/attachment',
         'attachmentMimeType': _text(message['attachmentMimeType']),
       },
-      if (replyToMap.isNotEmpty)
+      if (!isDeleted && replyToMap.isNotEmpty)
         'replyTo': <String, dynamic>{
           'messageId': _text(replyToMap['messageId']),
           'senderName': _text(replyToMap['senderName']),
           'excerpt': _text(replyToMap['excerpt']),
         },
-      'reactions': reactionsByEmoji.entries
-          .map(
-            (entry) => <String, dynamic>{
-              'emoji': entry.key,
-              'count': entry.value,
-              'reactedByMe': reactionsByUser[currentUserId] == entry.key,
-            },
-          )
-          .toList(growable: false),
-      if (pinnedBy.isNotEmpty) ...<String, dynamic>{
+      'reactions': isDeleted
+          ? const <JsonMap>[]
+          : reactionsByEmoji.entries
+                .map(
+                  (entry) => <String, dynamic>{
+                    'emoji': entry.key,
+                    'count': entry.value,
+                    'reactedByMe': reactionsByUser[currentUserId] == entry.key,
+                  },
+                )
+                .toList(growable: false),
+      if (!isDeleted && pinnedBy.isNotEmpty) ...<String, dynamic>{
         'pinnedBy': pinnedBy,
         'pinnedAt': _text(message['pinnedAt']),
         'canUnpin':
@@ -5586,6 +5663,9 @@ class PiwibusStore {
       'senderId': _text(input['senderId'] ?? input['sender_id']),
       'senderName': _text(input['senderName'] ?? input['sender_name']),
       'body': body,
+      'isDeleted': input['isDeleted'] == true || input['is_deleted'] == true,
+      if (_text(input['deletedAt'] ?? input['deleted_at']).isNotEmpty)
+        'deletedAt': _text(input['deletedAt'] ?? input['deleted_at']),
       'sequence': _int(input['sequence'] ?? input['message_order']),
       'updateRevision': _int(
         input['updateRevision'] ?? input['update_revision'],

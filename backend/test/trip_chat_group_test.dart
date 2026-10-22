@@ -435,6 +435,52 @@ void main() {
           ),
           throwsStateError,
         );
+        final directMessage = await store.sendMessageItem(
+          'actions-bob',
+          directId,
+          <String, dynamic>{'body': 'Message privé à annoter'},
+        );
+        final directMessageId = _string(
+          (directMessage['message'] as Map)['id'],
+        );
+        await store.setMessageReaction(
+          'actions-bob',
+          directId,
+          directMessageId,
+          <String, dynamic>{'emoji': '👍'},
+        );
+        await store.setMessageReaction(
+          'actions-charlie',
+          directId,
+          directMessageId,
+          <String, dynamic>{'emoji': '❤️'},
+        );
+        await store.pinMessage('actions-bob', directId, directMessageId);
+        final directMessageForCharlie = store
+            .conversationMessages('actions-charlie', directId)
+            .single;
+        expect(directMessageForCharlie['reactions'], <Map<String, dynamic>>[
+          <String, dynamic>{'emoji': '👍', 'count': 1, 'reactedByMe': false},
+          <String, dynamic>{'emoji': '❤️', 'count': 1, 'reactedByMe': true},
+        ]);
+        expect(directMessageForCharlie['pinnedBy'], isNotEmpty);
+        expect(directMessageForCharlie['canUnpin'], isFalse);
+        await expectLater(
+          store.unpinMessage('actions-charlie', directId, directMessageId),
+          throwsStateError,
+        );
+        final directMessageForBob = store
+            .conversationMessages('actions-bob', directId)
+            .single;
+        expect(directMessageForBob['canUnpin'], isTrue);
+        final directConversationForBob = store
+            .messageConversationsForSession('actions-bob')
+            .singleWhere((item) => item['id'] == directId);
+        expect(directConversationForBob['pinnedMessages'], hasLength(1));
+        final directConversationForCharlie = store
+            .messageConversationsForSession('actions-charlie')
+            .singleWhere((item) => item['id'] == directId);
+        expect(directConversationForCharlie['pinnedMessages'], hasLength(1));
 
         await store.close();
         store = await PiwibusStore.openWithPersistence(
@@ -452,11 +498,73 @@ void main() {
             .messageConversationsForSession('actions-bob')
             .firstWhere((item) => item['id'] == conversationId);
         expect(reloadedConversation['pinnedMessages'], hasLength(2));
+        final reloadedDirectConversation = store
+            .messageConversationsForSession('actions-bob')
+            .singleWhere((item) => item['id'] == directId);
+        expect(reloadedDirectConversation['pinnedMessages'], hasLength(1));
         await store.unpinMessage(
           'actions-owner',
           conversationId,
           firstMessageId,
         );
+        final replyRevisionBeforeDeletion =
+            reloadedReply['updateRevision'] as int;
+        await expectLater(
+          store.deleteMessage(
+            'actions-charlie',
+            conversationId,
+            firstMessageId,
+          ),
+          throwsStateError,
+        );
+        await store.deleteMessage(
+          'actions-bob',
+          conversationId,
+          firstMessageId,
+        );
+        final deletedForBob = store
+            .conversationMessages('actions-bob', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        final deletedForCharlie = store
+            .conversationMessages('actions-charlie', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(deletedForBob['isDeleted'], isTrue);
+        expect(deletedForBob['body'], 'Message supprimé');
+        expect(deletedForCharlie['body'], 'Message supprimé');
+        expect(deletedForCharlie['reactions'], isEmpty);
+        expect(deletedForCharlie.containsKey('pinnedBy'), isFalse);
+        final updatedReply = store
+            .conversationMessages('actions-charlie', conversationId)
+            .firstWhere((item) => item['id'] == replyMessageId);
+        expect((updatedReply['replyTo'] as Map)['excerpt'], 'Message supprimé');
+        expect(
+          updatedReply['updateRevision'] as int,
+          greaterThan(replyRevisionBeforeDeletion),
+        );
+        await expectLater(
+          store.setMessageReaction(
+            'actions-charlie',
+            conversationId,
+            firstMessageId,
+            <String, dynamic>{'emoji': '😂'},
+          ),
+          throwsStateError,
+        );
+        await store.deleteMessage('actions-bob', directId, directMessageId);
+        final deletedDirectForCharlie = store
+            .conversationMessages('actions-charlie', directId)
+            .single;
+        expect(deletedDirectForCharlie['body'], 'Message supprimé');
+
+        await store.close();
+        store = await PiwibusStore.openWithPersistence(
+          JsonFileStatePersistence(stateFile),
+        );
+        final persistedTombstone = store
+            .conversationMessages('actions-charlie', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(persistedTombstone['isDeleted'], isTrue);
+        expect(persistedTombstone['body'], 'Message supprimé');
       },
     );
 

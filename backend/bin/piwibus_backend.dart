@@ -1073,6 +1073,19 @@ Future<void> main(List<String> args) async {
     );
   });
 
+  router.delete('/messages/conversations/<id>/messages/<messageId>', (
+    Request request,
+    String id,
+    String messageId,
+  ) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(
+      request,
+      jwtCodec,
+      (_) => store.deleteMessage(sessionId, id, messageId),
+    );
+  });
+
   router.patch('/messages/conversations/<id>/delivered', (
     Request request,
     String id,
