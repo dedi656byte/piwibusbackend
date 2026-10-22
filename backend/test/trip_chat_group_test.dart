@@ -443,6 +443,29 @@ void main() {
         final directMessageId = _string(
           (directMessage['message'] as Map)['id'],
         );
+        await expectLater(
+          store.sendMessageItem('actions-bob', directId, <String, dynamic>{
+            'body': 'Réponse à un message d’une autre conversation',
+            'replyToMessageId': firstMessageId,
+          }),
+          throwsStateError,
+        );
+        final directReply = await store.sendMessageItem(
+          'actions-charlie',
+          directId,
+          <String, dynamic>{
+            'body': 'Réponse privée citée',
+            'replyToMessageId': directMessageId,
+          },
+        );
+        final directReplyMessageId = _string(
+          (directReply['message'] as Map)['id'],
+        );
+        expect((directReply['message'] as Map)['replyTo'], <String, dynamic>{
+          'messageId': directMessageId,
+          'senderName': 'Bob',
+          'excerpt': 'Message privé à annoter',
+        });
         await store.setMessageReaction(
           'actions-bob',
           directId,
@@ -458,7 +481,7 @@ void main() {
         await store.pinMessage('actions-bob', directId, directMessageId);
         final directMessageForCharlie = store
             .conversationMessages('actions-charlie', directId)
-            .single;
+            .firstWhere((item) => item['id'] == directMessageId);
         expect(directMessageForCharlie['reactions'], <Map<String, dynamic>>[
           <String, dynamic>{'emoji': '👍', 'count': 1, 'reactedByMe': false},
           <String, dynamic>{'emoji': '❤️', 'count': 1, 'reactedByMe': true},
@@ -471,7 +494,7 @@ void main() {
         );
         final directMessageForBob = store
             .conversationMessages('actions-bob', directId)
-            .single;
+            .firstWhere((item) => item['id'] == directMessageId);
         expect(directMessageForBob['canUnpin'], isTrue);
         final directConversationForBob = store
             .messageConversationsForSession('actions-bob')
@@ -502,6 +525,13 @@ void main() {
             .messageConversationsForSession('actions-bob')
             .singleWhere((item) => item['id'] == directId);
         expect(reloadedDirectConversation['pinnedMessages'], hasLength(1));
+        final reloadedDirectReply = store
+            .conversationMessages('actions-charlie', directId)
+            .firstWhere((item) => item['id'] == directReplyMessageId);
+        expect(
+          (reloadedDirectReply['replyTo'] as Map)['messageId'],
+          directMessageId,
+        );
         await store.unpinMessage(
           'actions-owner',
           conversationId,
@@ -553,7 +583,7 @@ void main() {
         await store.deleteMessage('actions-bob', directId, directMessageId);
         final deletedDirectForCharlie = store
             .conversationMessages('actions-charlie', directId)
-            .single;
+            .firstWhere((item) => item['id'] == directMessageId);
         expect(deletedDirectForCharlie['body'], 'Message supprimé');
 
         await store.close();

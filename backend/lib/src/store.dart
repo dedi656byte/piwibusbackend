@@ -2274,11 +2274,6 @@ class PiwibusStore {
     );
     JsonMap? replyTo;
     if (replyToMessageId.isNotEmpty) {
-      if (_text(conversation['kind']) != 'trip') {
-        throw StateError(
-          'Les réponses citées sont réservées aux discussions de groupe.',
-        );
-      }
       final repliedMessage = messages.firstWhere(
         (existingMessage) => _text(existingMessage['id']) == replyToMessageId,
         orElse: () => <String, dynamic>{},
