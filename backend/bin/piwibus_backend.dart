@@ -1179,14 +1179,24 @@ Future<void> main(List<String> args) async {
   });
   router.post('/trips/<id>/ratings', (Request request, String id) async {
     final sessionId = await sessionIdFor(request);
-    return _handleJson(request, jwtCodec, (body) {
+    return _handleJson(request, jwtCodec, (body) async {
       final score = int.tryParse(_string(body['score']));
       if (score == null || score < 1 || score > 5) {
         throw const FormatException(
           'La note doit être un entier entre 1 et 5.',
         );
       }
-      return store.rateTrip(sessionId, id, score);
+      final result = await store.rateTrip(sessionId, id, score);
+      final audience = store.notificationAudienceForTripOwner(id);
+      unawaited(
+        pushNotifications.sendToTokens(
+          tokens: audience.tokens,
+          title: 'Nouvelle note',
+          body: 'Votre trajet a reçu une nouvelle évaluation.',
+          data: <String, String>{'type': 'trip_rated', 'tripId': id},
+        ),
+      );
+      return result;
     });
   });
   router.post('/trips/<id>/likes', (Request request, String id) async {

@@ -3939,12 +3939,14 @@ class PiwibusStore {
     String? reason,
   }) async {
     final session = _session(sessionId);
-    final stopReason = reason?.trim() ?? '';
+    final requestedStopReason = reason?.trim() ?? '';
+    var stopReason = requestedStopReason;
     final trips = _trips();
     final activityAudience = notificationAudienceForTrip(tripId).sessionIds
       ..add(sessionId);
     var found = false;
     JsonMap? stoppedTrip;
+    var stoppedByOwner = false;
     for (final trip in trips) {
       if (_text(trip['id']) == tripId) {
         found = true;
@@ -3954,13 +3956,20 @@ class PiwibusStore {
         if (_text(trip['status']) != 'actif') {
           return snapshot(sessionId);
         }
-        _addTripNetworkUsage(
-          trip,
-          stopReason.isEmpty
-              ? <String, dynamic>{'tripId': tripId}
-              : <String, dynamic>{'tripId': tripId, 'reason': stopReason},
-          responseKind: _TripNetworkResponseKind.snapshot,
+        stoppedByOwner = _sessionOwnsOwnerId(
+          sessionId,
+          session,
+          _text(trip['owner_id']),
         );
+        if (stopReason.isEmpty) {
+          stopReason = stoppedByOwner
+              ? 'L’Étoile a arrêté la diffusion de ce trajet.'
+              : 'Trajet arrêté par un administrateur Piwibus.';
+        }
+        _addTripNetworkUsage(trip, <String, dynamic>{
+          'tripId': tripId,
+          'reason': stopReason,
+        }, responseKind: _TripNetworkResponseKind.snapshot);
         trip['status'] = 'termine';
         trip['lastUpdatedAt'] = _nowIso();
         stoppedTrip = trip;
@@ -3995,10 +4004,10 @@ class PiwibusStore {
         (_rememberStarTripForOwner(stoppedTrip) ||
             _rememberStarTripForSessionOwner(sessionId, session, stoppedTrip));
     addActivity(
-      title: stopReason.isEmpty ? 'Trajet arrêté' : 'Trajet retiré',
-      subtitle: stopReason.isEmpty
-          ? 'Le suivi live a été fermé pour ce trajet.'
-          : stopReason,
+      title: stoppedByOwner && requestedStopReason.isEmpty
+          ? 'Trajet arrêté'
+          : 'Trajet retiré',
+      subtitle: stopReason,
       iconKey: 'stop',
       colorValue: 0xFFD1495B,
       audienceSessionIds: activityAudience,
@@ -4100,12 +4109,13 @@ class PiwibusStore {
     trip['ratingCount'] = count;
     trip['ratedByActorIds'] = <String>[...ratedByActorIds, actorId]..sort();
     trip['lastUpdatedAt'] = _nowIso();
-    final activityAudience = notificationAudienceForTrip(tripId).sessionIds
-      ..add(sessionId);
+    final activityAudience = notificationAudienceForTripOwner(
+      tripId,
+    ).sessionIds;
     _state['trips'] = trips;
     addActivity(
-      title: 'Note enregistrée',
-      subtitle: 'Le trajet a reçu une nouvelle évaluation.',
+      title: 'Nouvelle note',
+      subtitle: 'Votre trajet a reçu une nouvelle évaluation.',
       iconKey: 'star',
       colorValue: 0xFFEE964B,
       audienceSessionIds: activityAudience,
@@ -4803,6 +4813,7 @@ class PiwibusStore {
       ratedByActorIds,
       sessionId,
     );
+    public['lastSystemMessage'] = _lastSystemMessage(trip);
     public.remove('likedByActorIds');
     public.remove('liked_by_actor_ids');
     if (!includeAdminTelemetry) {

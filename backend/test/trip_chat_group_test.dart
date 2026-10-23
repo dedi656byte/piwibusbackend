@@ -24,12 +24,18 @@ void main() {
         'email': 'liker@example.com',
         'password': 'password123',
       });
+      await store.register('observer-session', <String, dynamic>{
+        'fullName': 'Trip Observer',
+        'email': 'observer@example.com',
+        'password': 'password123',
+      });
       await store.startTrip('owner-session', <String, dynamic>{
         'tripId': 'trip-like-test',
         'lineCode': lineCode,
         'liveLocation': _routePointLocation(line),
       });
       await store.selectTrip('liker-session', 'trip-like-test');
+      await store.selectTrip('observer-session', 'trip-like-test');
 
       final result = await store.setTripLike(
         'liker-session',
@@ -44,6 +50,21 @@ void main() {
         ),
         isTrue,
       );
+      final likerActivity = store.snapshot('liker-session')['activity'] as List;
+      final observerActivity =
+          store.snapshot('observer-session')['activity'] as List;
+      expect(
+        likerActivity.any(
+          (item) => item is Map && item['title'] == "Nouveau j'aime",
+        ),
+        isFalse,
+      );
+      expect(
+        observerActivity.any(
+          (item) => item is Map && item['title'] == "Nouveau j'aime",
+        ),
+        isFalse,
+      );
 
       final duplicate = await store.setTripLike(
         'liker-session',
@@ -56,6 +77,81 @@ void main() {
               .where((item) => item is Map && item['title'] == "Nouveau j'aime")
               .length;
       expect(activityCount, 1);
+    });
+
+    test('notifies only the trip owner when a new rating is added', () async {
+      final store = await _openTempStore('piwibus-trip-rating');
+      final line = store.lines().first;
+      final lineCode = _string(line['code']);
+
+      await store.register('rating-owner-session', <String, dynamic>{
+        'fullName': 'Trip Owner',
+        'email': 'rating-owner@example.com',
+        'password': 'password123',
+      });
+      await store.register('rating-author-session', <String, dynamic>{
+        'fullName': 'Trip Rater',
+        'email': 'rater@example.com',
+        'password': 'password123',
+      });
+      await store.register('rating-observer-session', <String, dynamic>{
+        'fullName': 'Trip Observer',
+        'email': 'rating-observer@example.com',
+        'password': 'password123',
+      });
+      await store.registerPushToken('rating-owner-session', <String, dynamic>{
+        'token': 'rating-owner-push-token-0001',
+        'platform': 'android',
+      });
+      await store.registerPushToken('rating-author-session', <String, dynamic>{
+        'token': 'rating-author-push-token-0001',
+        'platform': 'android',
+      });
+      await store.registerPushToken(
+        'rating-observer-session',
+        <String, dynamic>{
+          'token': 'rating-observer-push-token-0001',
+          'platform': 'android',
+        },
+      );
+      await store.startTrip('rating-owner-session', <String, dynamic>{
+        'tripId': 'trip-rating-test',
+        'lineCode': lineCode,
+        'liveLocation': _routePointLocation(line),
+      });
+      await store.selectTrip('rating-author-session', 'trip-rating-test');
+      await store.selectTrip('rating-observer-session', 'trip-rating-test');
+
+      expect(
+        store.notificationAudienceForTripOwner('trip-rating-test').tokens,
+        <String>['rating-owner-push-token-0001'],
+      );
+      await store.rateTrip('rating-author-session', 'trip-rating-test', 5);
+
+      final ownerActivity =
+          store.snapshot('rating-owner-session')['activity'] as List;
+      final authorActivity =
+          store.snapshot('rating-author-session')['activity'] as List;
+      final observerActivity =
+          store.snapshot('rating-observer-session')['activity'] as List;
+      expect(
+        ownerActivity.any(
+          (item) => item is Map && item['title'] == 'Nouvelle note',
+        ),
+        isTrue,
+      );
+      expect(
+        authorActivity.any(
+          (item) => item is Map && item['title'] == 'Nouvelle note',
+        ),
+        isFalse,
+      );
+      expect(
+        observerActivity.any(
+          (item) => item is Map && item['title'] == 'Nouvelle note',
+        ),
+        isFalse,
+      );
     });
 
     test(

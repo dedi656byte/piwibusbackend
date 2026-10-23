@@ -42,6 +42,7 @@ void main() {
         'lineCode': _text(line['code']),
         'liveLocation': _routePointLocation(line),
       });
+      await store.selectTrip('other-user-session', tripId);
 
       final firstStop = await store.stopTrip('trip-owner-session', tripId);
       final firstTrip = _tripFromSnapshot(firstStop, tripId);
@@ -61,6 +62,59 @@ void main() {
       );
     },
   );
+
+  test('manual owner stop exposes an accurate reason to observers', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'piwibus-trip-manual-stop',
+    );
+    final persistence = JsonFileStatePersistence(
+      File(p.join(tempDir.path, 'state.json')),
+    );
+    final store = await PiwibusStore.openWithPersistence(persistence);
+    addTearDown(() async {
+      await store.close();
+      if (tempDir.existsSync()) {
+        await tempDir.delete(recursive: true);
+      }
+    });
+
+    await store.register('manual-stop-owner-session', <String, dynamic>{
+      'fullName': 'Trip Owner',
+      'email': 'manual-stop-owner@example.com',
+      'password': 'password123',
+    });
+    await store.register('manual-stop-observer-session', <String, dynamic>{
+      'fullName': 'Trip Observer',
+      'email': 'manual-stop-observer@example.com',
+      'password': 'password123',
+    });
+    final line = store.lines().first;
+    const tripId = 'trip-manual-stop-reason';
+    await store.startTrip('manual-stop-owner-session', <String, dynamic>{
+      'tripId': tripId,
+      'lineCode': _text(line['code']),
+      'liveLocation': _routePointLocation(line),
+    });
+    await store.selectTrip('manual-stop-observer-session', tripId);
+
+    await store.stopTrip('manual-stop-owner-session', tripId);
+
+    const expectedReason = 'L’Étoile a arrêté la diffusion de ce trajet.';
+    final observerStatus = store.tripStatusForSession(
+      'manual-stop-observer-session',
+      tripId,
+    );
+    expect(observerStatus?['status'], 'termine');
+    expect(observerStatus?['lastSystemMessage'], expectedReason);
+
+    final observerSnapshot = store.snapshot('manual-stop-observer-session');
+    final stoppedTrip = _tripFromSnapshot(observerSnapshot, tripId);
+    expect(stoppedTrip['lastSystemMessage'], expectedReason);
+    final stopActivity = (observerSnapshot['activity'] as List)
+        .whereType<Map>()
+        .firstWhere((value) => value['title'] == 'Trajet arrêté');
+    expect(stopActivity['subtitle'], expectedReason);
+  });
 }
 
 String _text(Object? value) => value?.toString() ?? '';
