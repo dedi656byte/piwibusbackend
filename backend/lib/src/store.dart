@@ -2929,7 +2929,7 @@ class PiwibusStore {
     final session = _session(sessionId);
     session['currentUser'] = _publicUser(user);
     session['activeRole'] = _initialActiveRoleFor(user);
-    session['section'] = 'carte';
+    session['section'] = 'accueil';
     _putSession(sessionId, session);
     addActivity(
       title: 'Mot de passe reinitialise',
@@ -2956,7 +2956,7 @@ class PiwibusStore {
     );
     session['currentUser'] = null;
     session['activeRole'] = 'etoile';
-    session['section'] = 'accueil';
+    session['section'] = 'carte';
     session['selectedTripId'] = null;
     session['selectedLineCode'] = null;
     final rotatedSessionId = _rotateSessionId(
@@ -6355,7 +6355,7 @@ class PiwibusStore {
     if (clearCurrentUser) {
       normalized['currentUser'] = null;
       normalized['activeRole'] = 'etoile';
-      normalized['section'] = 'accueil';
+      normalized['section'] = 'carte';
     }
     normalized['createdAt'] = _nowIso();
     normalized['lastSeenAt'] = _nowIso();
