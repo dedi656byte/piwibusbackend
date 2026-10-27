@@ -1610,18 +1610,16 @@ class PiwibusStore {
     );
 
     if (index < 0) {
-      throw StateError(
-        'Compte introuvable. Créez un compte avant de vous connecter.',
-      );
+      throw StateError('Email ou mot de passe incorrect.');
     }
 
     final user = users[index];
     final existingHash = _text(user['passwordHash']);
     if (!_verifyPassword(email, password, existingHash)) {
-      throw StateError('Mot de passe invalide pour cet utilisateur.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
     if (_text(user['status']) == 'suspendu') {
-      throw StateError('Ce compte est suspendu.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
     user['passwordHash'] = hashed;
     user['lastSeenAt'] = now;
@@ -1694,11 +1692,11 @@ class PiwibusStore {
       (user) => _text(user['email']).toLowerCase() == email,
     );
     if (exists) {
-      throw StateError('Un compte existe déjà  avec cette adresse email.');
+      throw StateError('Impossible de créer le compte avec ces informations.');
     }
 
     if (_userNameExists(users, fullName)) {
-      throw StateError("Ce nom d'utilisateur est deja pris.");
+      throw StateError('Impossible de créer le compte avec ces informations.');
     }
 
     final user = _user(
@@ -2803,7 +2801,6 @@ class PiwibusStore {
 
   Future<JsonMap> requestPasswordReset(
     JsonMap body, {
-    bool includeResetCode = false,
     PasswordResetCodeSender? sendCode,
   }) async {
     final email = _boundedText(
@@ -2814,6 +2811,9 @@ class PiwibusStore {
     if (!_isValidEmail(email)) {
       throw StateError('Adresse email invalide.');
     }
+    if (sendCode == null) {
+      throw StateError('Service email de reinitialisation non configure.');
+    }
 
     final users = _users();
     final index = users.indexWhere(
@@ -2822,7 +2822,7 @@ class PiwibusStore {
     final generic = <String, dynamic>{
       'email': email,
       'message':
-          'Si un compte Piwibus existe avec cet email, un code de reinitialisation a ete genere.',
+          'Si cette adresse est associée à un compte Piwibus, vous recevrez un code de réinitialisation.',
     };
     if (index < 0) return generic;
 
@@ -2841,11 +2841,7 @@ class PiwibusStore {
     _state['users'] = users;
     await _persist(const StateMutationBatch(users: true));
     try {
-      if (sendCode != null) {
-        await sendCode(email: email, code: code, expiresAt: expiresAtDate);
-      } else if (!includeResetCode) {
-        throw StateError('Service email de reinitialisation non configure.');
-      }
+      await sendCode(email: email, code: code, expiresAt: expiresAtDate);
     } catch (_) {
       _clearPasswordReset(user);
       _state['users'] = users;
@@ -2861,11 +2857,7 @@ class PiwibusStore {
     );
     _notifySharedChange();
     await _persist(const StateMutationBatch(activity: true));
-    return <String, dynamic>{
-      ...generic,
-      'expiresAt': expiresAt,
-      if (includeResetCode) 'resetCode': code,
-    };
+    return generic;
   }
 
   Future<JsonMap> confirmPasswordReset(String sessionId, JsonMap body) async {

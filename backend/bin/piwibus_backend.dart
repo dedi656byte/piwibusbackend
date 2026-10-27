@@ -15,6 +15,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../lib/src/ops_logger.dart';
 import '../lib/src/password_reset_email_service.dart';
+import '../lib/src/public_health.dart';
 import '../lib/src/production_config.dart';
 import '../lib/src/push_notifications.dart';
 import '../lib/src/rate_limiter.dart';
@@ -22,7 +23,6 @@ import '../lib/src/redis_realtime.dart';
 import '../lib/src/state_persistence.dart';
 import '../lib/src/store.dart';
 
-const String _backendBuildLabel = '2026-06-25-live-timeout-v1';
 const Duration _realtimeSnapshotDebounce = Duration(milliseconds: 100);
 const Duration _realtimeKeepAliveInterval = Duration(seconds: 30);
 const double _realtimeRelevanceRadiusMeters = 2500;
@@ -204,28 +204,10 @@ Future<void> main(List<String> args) async {
     try {
       await store.checkReady();
       await redis?.checkReady();
-      return _json(
-        _readinessPayload(
-          store: store,
-          redis: redis,
-          productionConfig: productionConfig,
-          pushNotifications: pushNotifications,
-          passwordResetEmail: passwordResetEmail,
-        ),
-      );
-    } catch (error) {
-      return _json(
-        _readinessPayload(
-          store: store,
-          redis: redis,
-          productionConfig: productionConfig,
-          pushNotifications: pushNotifications,
-          passwordResetEmail: passwordResetEmail,
-          status: 'degraded',
-          error: error.toString(),
-        ),
-        statusCode: 503,
-      );
+      return publicReadinessResponse(ready: true);
+    } catch (error, stackTrace) {
+      logger.error('readiness_check_failed', const {}, error, stackTrace);
+      return publicReadinessResponse(ready: false);
     }
   });
   router.get('/metrics', (Request request) {
@@ -617,19 +599,43 @@ Future<void> main(List<String> args) async {
     );
   });
   Future<Response> handlePasswordResetRequest(Request request) async {
+    late final JsonMap body;
     try {
-      final body = await _readJson(request);
+      body = await _readJson(request);
+    } catch (error) {
+      return _errorForException(error);
+    }
+    if (!passwordResetEmail.enabled) {
+      return _error(
+        'Service de réinitialisation temporairement indisponible.',
+        statusCode: 503,
+      );
+    }
+    try {
       return _json(
         await store.requestPasswordReset(
           body,
-          includeResetCode: _includePasswordResetCode(),
-          sendCode: passwordResetEmail.enabled
-              ? passwordResetEmail.sendPasswordResetCode
-              : null,
+          sendCode: passwordResetEmail.sendPasswordResetCode,
         ),
       );
-    } catch (error) {
-      return _errorForException(error);
+    } catch (error, stackTrace) {
+      if (error is StateError && error.message == 'Adresse email invalide.') {
+        return _errorForException(error);
+      }
+      logger.error(
+        'password_reset_request_failed',
+        const {},
+        error,
+        stackTrace,
+      );
+      final requestedEmail = body['email'];
+      return _json(<String, String>{
+        'email': requestedEmail is String
+            ? requestedEmail.trim().toLowerCase()
+            : '',
+        'message':
+            'Si cette adresse est associée à un compte Piwibus, vous recevrez un code de réinitialisation.',
+      });
     }
   }
 
@@ -1297,7 +1303,7 @@ Future<void> main(List<String> args) async {
       .addMiddleware(_corsMiddleware(corsOrigin))
       .addMiddleware(metrics.middleware())
       .addMiddleware(_requestLogMiddleware(logger))
-      .addMiddleware(_storageReadinessMiddleware(store))
+      .addMiddleware(_storageReadinessMiddleware(store, logger))
       .addMiddleware(rateLimiter.middleware())
       .addHandler(router.call);
 
@@ -1393,35 +1399,7 @@ Future<JsonMap> _readJson(
   throw const FormatException('Le corps JSON doit être un objet.');
 }
 
-JsonMap _readinessPayload({
-  required PiwibusStore store,
-  required RedisRealtime? redis,
-  required ProductionConfig productionConfig,
-  required PushNotificationService pushNotifications,
-  required PasswordResetEmailService passwordResetEmail,
-  String status = 'ok',
-  String? error,
-}) {
-  return <String, dynamic>{
-    'status': status,
-    'storage': store.storageBackend,
-    'databaseBacked': store.isDatabaseBacked,
-    'geospatialQueries': store.supportsGeospatialQueries,
-    'environment': productionConfig.environment,
-    'redisRealtime': redis?.isSubscriptionReady ?? false,
-    'pushNotifications': pushNotifications.enabled,
-    'build': _backendBuildLabel,
-    'adminAssetVersion': _adminAssetVersion,
-    if (error != null && error.isNotEmpty) 'error': error,
-    'features': <String, dynamic>{
-      'passwordReset': true,
-      'passwordResetEmail': passwordResetEmail.enabled,
-      'adminWeb': true,
-    },
-  };
-}
-
-Middleware _storageReadinessMiddleware(PiwibusStore store) {
+Middleware _storageReadinessMiddleware(PiwibusStore store, OpsLogger logger) {
   return (Handler innerHandler) {
     return (Request request) async {
       if (_skipsStorageReadiness(request)) {
@@ -1429,16 +1407,14 @@ Middleware _storageReadinessMiddleware(PiwibusStore store) {
       }
       try {
         await store.checkReady();
-      } catch (error) {
-        return _json(
-          <String, dynamic>{
-            'error': 'Service temporairement indisponible.',
-            'status': 'degraded',
-            'detail': error.toString(),
-          },
-          statusCode: 503,
-          headers: const <String, String>{'Retry-After': '10'},
+      } catch (error, stackTrace) {
+        logger.error(
+          'storage_readiness_check_failed',
+          const {},
+          error,
+          stackTrace,
         );
+        return publicStorageUnavailableResponse();
       }
       return innerHandler(request);
     };
@@ -2709,16 +2685,6 @@ String? _argValue(List<String> args, String name) {
     return null;
   }
   return args[index + 1];
-}
-
-bool _includePasswordResetCode() {
-  final explicit =
-      (Platform.environment['PIWIBUS_PASSWORD_RESET_SHOW_CODE'] ?? '')
-          .trim()
-          .toLowerCase();
-  if (explicit == 'true' || explicit == '1' || explicit == 'yes') return true;
-  if (explicit == 'false' || explicit == '0' || explicit == 'no') return false;
-  return false;
 }
 
 Iterable<String>? _webSocketAllowedOrigins(String allowOrigin) {
