@@ -18,44 +18,25 @@ class ProductionConfig {
   final bool allowDevDefaults;
 
   bool get isProduction => environment == 'production';
+  bool get requiresSecureCookies => isProduction;
 
-  factory ProductionConfig.fromEnvironment([
-    Map<String, String>? environment,
-  ]) {
+  factory ProductionConfig.fromEnvironment([Map<String, String>? environment]) {
     final env = environment ?? Platform.environment;
     return ProductionConfig._(
-      environment: (env['PIWIBUS_ENV'] ?? 'development')
-          .trim()
-          .toLowerCase(),
-      databaseUrl:
-          (env['PIWIBUS_DATABASE_URL'] ??
-                  env['DATABASE_URL'] ??
-                  '')
-              .trim(),
-      redisUrl:
-          (env['PIWIBUS_REDIS_URL'] ??
-                  env['REDIS_URL'] ??
-                  '')
-              .trim(),
+      environment: (env['PIWIBUS_ENV'] ?? 'development').trim().toLowerCase(),
+      databaseUrl: (env['PIWIBUS_DATABASE_URL'] ?? env['DATABASE_URL'] ?? '')
+          .trim(),
+      redisUrl: (env['PIWIBUS_REDIS_URL'] ?? env['REDIS_URL'] ?? '').trim(),
       corsOrigin: (env['PIWIBUS_CORS_ORIGIN'] ?? '*').trim(),
-      jwtSecret:
-          (env['PIWIBUS_JWT_SECRET'] ??
-                  env['JWT_SECRET'] ??
-                  '')
-              .trim(),
-      allowDevDefaults: (env['PIWIBUS_ALLOW_DEV_DEFAULTS'] ?? '')
-              .trim()
-              .toLowerCase() ==
+      jwtSecret: (env['PIWIBUS_JWT_SECRET'] ?? env['JWT_SECRET'] ?? '').trim(),
+      allowDevDefaults:
+          (env['PIWIBUS_ALLOW_DEV_DEFAULTS'] ?? '').trim().toLowerCase() ==
           'true',
     );
   }
 
   void validateOrThrow() {
-    const supportedEnvironments = <String>{
-      'development',
-      'test',
-      'production',
-    };
+    const supportedEnvironments = <String>{'development', 'test', 'production'};
     if (!supportedEnvironments.contains(environment)) {
       throw StateError(
         'PIWIBUS_ENV invalide. Valeurs acceptees : '

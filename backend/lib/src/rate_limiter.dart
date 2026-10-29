@@ -10,11 +10,13 @@ class RateLimiter {
     required this.limitPerMinute,
     required RedisRealtime? redis,
     this.trustProxyHeaders = false,
+    this.pathLimitsPerMinute = const <String, int>{},
   }) : _redis = redis;
 
   final int limitPerMinute;
   final RedisRealtime? _redis;
   final bool trustProxyHeaders;
+  final Map<String, int> pathLimitsPerMinute;
   final Map<String, _RateLimitBucket> _buckets = <String, _RateLimitBucket>{};
 
   Middleware middleware() {
@@ -23,7 +25,13 @@ class RateLimiter {
         if (_isSkipped(request)) {
           return innerHandler(request);
         }
-        final allowed = await _check(request);
+        final pathLimit =
+            pathLimitsPerMinute[request.url.path] ?? limitPerMinute;
+        final allowed = await _check(
+          _clientKey(request),
+          pathLimit,
+          namespace: request.url.path,
+        );
         if (!allowed) {
           return Response(
             429,
@@ -40,32 +48,39 @@ class RateLimiter {
   }
 
   bool _isSkipped(Request request) {
-    return limitPerMinute <= 0 ||
-        request.method == 'OPTIONS' ||
+    return request.method == 'OPTIONS' ||
         request.url.path == 'health' ||
         request.url.path == 'ready' ||
         request.url.path == 'metrics';
   }
 
-  Future<bool> _check(Request request) async {
-    final key = _clientKey(request);
+  Future<bool> checkAdditionalKey({required String key, required int limit}) {
+    return _check(key, limit, namespace: 'additional');
+  }
+
+  Future<bool> _check(
+    String key,
+    int limit, {
+    required String namespace,
+  }) async {
+    if (limit <= 0) return true;
     final redis = _redis;
     if (redis != null) {
       final minute = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 60000;
       final count = await redis.incrementRateLimit(
-        key: 'piwibus:rate:$minute:$key',
+        key: 'piwibus:rate:$minute:$namespace:$key',
         window: const Duration(seconds: 75),
       );
-      if (count != null) return count <= limitPerMinute;
+      if (count != null) return count <= limit;
     }
-    return _checkInMemory(key);
+    return _checkInMemory('$namespace:$key', limit);
   }
 
-  bool _checkInMemory(String key) {
+  bool _checkInMemory(String key, int limit) {
     final now = DateTime.now();
     final bucket = _buckets.putIfAbsent(key, () => _RateLimitBucket());
     bucket.removeExpired(now);
-    if (bucket.hits.length >= limitPerMinute) return false;
+    if (bucket.hits.length >= limit) return false;
     bucket.hits.add(now);
     if (_buckets.length > 2000) {
       _buckets.removeWhere((_, value) => value.isExpired(now));

@@ -88,6 +88,14 @@ Future<void> main(List<String> args) async {
         180,
     redis: redis,
     trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS'),
+    pathLimitsPerMinute: const <String, int>{
+      'auth/sign-in': 10,
+      'admin/auth/login': 10,
+      'auth/password-reset/request': 5,
+      'auth/password-reset/request/': 5,
+      'auth/reset-password/request': 5,
+      'auth/forgot-password': 5,
+    },
   );
   const defaultStaleTripTimeout = Duration(seconds: 150);
   final staleTripTimeout = _durationFromEnvSeconds(
@@ -220,14 +228,29 @@ Future<void> main(List<String> args) async {
   });
   router.post('/admin/auth/login', (Request request) async {
     try {
-      final sessionId = await sessionIdFor(request);
       final body = await _readJson(request);
+      if (!await _checkAccountRateLimit(
+        rateLimiter,
+        body,
+        namespace: 'admin-login',
+        limit: 10,
+      )) {
+        return _rateLimitedResponse();
+      }
+      final sessionId = await sessionIdFor(request);
       await store.adminSignIn(sessionId, body);
       final token = jwtCodec.issue(sessionId, ttl: _adminJwtTtl);
-      return _json(<String, dynamic>{
-        'csrfToken': jwtCodec.csrfToken(sessionId),
-        'dashboard': adminDashboardFor(sessionId),
-      }, headers: _adminSessionCookieHeaders(request, token));
+      return _json(
+        <String, dynamic>{
+          'csrfToken': jwtCodec.csrfToken(sessionId),
+          'dashboard': adminDashboardFor(sessionId),
+        },
+        headers: _adminSessionCookieHeaders(
+          request,
+          token,
+          secure: productionConfig.requiresSecureCookies,
+        ),
+      );
     } catch (error) {
       return _errorForException(error);
     }
@@ -237,9 +260,13 @@ Future<void> main(List<String> args) async {
       final sessionId = await adminSessionIdFor(request);
       _requireAdminCsrf(request, sessionId, jwtCodec);
       await store.logout(sessionId);
-      return _json(<String, dynamic>{
-        'ok': true,
-      }, headers: _clearAdminSessionCookieHeaders(request));
+      return _json(
+        <String, dynamic>{'ok': true},
+        headers: _clearAdminSessionCookieHeaders(
+          request,
+          secure: productionConfig.requiresSecureCookies,
+        ),
+      );
     } catch (error) {
       return _errorForException(error, fallbackStatusCode: 401);
     }
@@ -252,6 +279,7 @@ Future<void> main(List<String> args) async {
         headers: _adminSessionCookieHeaders(
           request,
           jwtCodec.issue(sessionId, ttl: _adminJwtTtl),
+          secure: productionConfig.requiresSecureCookies,
         ),
       );
     } catch (error) {
@@ -279,9 +307,9 @@ Future<void> main(List<String> args) async {
       if (error is ConcurrentStateMutationException) {
         return _errorForException(error);
       }
-      return _text(
-        error is StateError ? error.message : error.toString(),
-        statusCode: error is StateError ? 400 : 502,
+      return _errorForException(
+        error,
+        fallbackStatusCode: error is StateError ? 400 : 502,
       );
     }
   });
@@ -583,12 +611,26 @@ Future<void> main(List<String> args) async {
   });
 
   router.post('/auth/sign-in', (Request request) async {
-    final sessionId = await sessionIdFor(request);
-    return _handleJson(
-      request,
-      jwtCodec,
-      (body) => store.signIn(sessionId, body),
-    );
+    try {
+      final body = await _readJson(request);
+      if (!await _checkAccountRateLimit(
+        rateLimiter,
+        body,
+        namespace: 'user-login',
+        limit: 10,
+      )) {
+        return _rateLimitedResponse();
+      }
+      final sessionId = await sessionIdFor(request);
+      return _handleJson(
+        request,
+        jwtCodec,
+        (body) => store.signIn(sessionId, body),
+        body: body,
+      );
+    } catch (error) {
+      return _errorForException(error);
+    }
   });
   router.post('/auth/register', (Request request) async {
     final sessionId = await sessionIdFor(request);
@@ -1015,16 +1057,7 @@ Future<void> main(List<String> args) async {
       }
       return _json(_snapshotForRequest(request, result, jwtCodec));
     } catch (error) {
-      if (error is ConcurrentStateMutationException) {
-        return _errorForException(error);
-      }
-      if (error is StateError) {
-        return _error(error.message);
-      }
-      if (error is FormatException) {
-        return _error(error.message);
-      }
-      return _error(error.toString());
+      return _errorForException(error);
     }
   });
 
@@ -1346,11 +1379,14 @@ Future<void> main(List<String> args) async {
 Future<Response> _handleJson(
   Request request,
   _JwtCodec jwtCodec,
-  FutureOr<JsonMap> Function(JsonMap body) action,
-) async {
+  FutureOr<JsonMap> Function(JsonMap body) action, {
+  JsonMap? body,
+}) async {
   try {
-    final body = await _readJson(request);
-    return _json(_snapshotForRequest(request, await action(body), jwtCodec));
+    final requestBody = body ?? await _readJson(request);
+    return _json(
+      _snapshotForRequest(request, await action(requestBody), jwtCodec),
+    );
   } catch (error) {
     if (error is ConcurrentStateMutationException) {
       return _errorForException(error);
@@ -1361,7 +1397,7 @@ Future<Response> _handleJson(
     if (error is FormatException) {
       return _error(error.message);
     }
-    return _error(error.toString());
+    return _errorForException(error);
   }
 }
 
@@ -1499,12 +1535,45 @@ Response _errorForException(Object error, {int fallbackStatusCode = 400}) {
       'code': ConcurrentStateMutationException.code,
     }, statusCode: 409);
   }
-  final message = error is StateError
-      ? error.message
-      : error is FormatException
-      ? error.message
-      : error.toString();
-  return _error(message, statusCode: fallbackStatusCode);
+  if (error is StateError) {
+    return _error(error.message, statusCode: fallbackStatusCode);
+  }
+  if (error is FormatException) {
+    return _error(error.message, statusCode: fallbackStatusCode);
+  }
+  const OpsLogger().error('Unhandled request exception', <String, Object?>{
+    'errorType': error.runtimeType.toString(),
+  });
+  return _error(
+    'Une erreur interne est survenue. Veuillez réessayer.',
+    statusCode: 500,
+  );
+}
+
+Future<bool> _checkAccountRateLimit(
+  RateLimiter rateLimiter,
+  JsonMap body, {
+  required String namespace,
+  required int limit,
+}) async {
+  final email = body['email']?.toString().trim().toLowerCase() ?? '';
+  if (email.isEmpty) return true;
+  final accountKey = sha256.convert(utf8.encode(email)).toString();
+  return rateLimiter.checkAdditionalKey(
+    key: '$namespace:$accountKey',
+    limit: limit,
+  );
+}
+
+Response _rateLimitedResponse() {
+  return Response(
+    429,
+    body: '{"error":"Trop de requetes. Reessayez plus tard."}',
+    headers: const <String, String>{
+      HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+      'Retry-After': '60',
+    },
+  );
 }
 
 Future<Response> _proxyOpenStreetMapTile(
@@ -2577,18 +2646,30 @@ List<JsonMap> _mapList(Object? value) {
       .toList(growable: false);
 }
 
-Map<String, String> _adminSessionCookieHeaders(Request request, String token) {
+Map<String, String> _adminSessionCookieHeaders(
+  Request request,
+  String token, {
+  required bool secure,
+}) {
   return <String, String>{
-    HttpHeaders.setCookieHeader: _adminSessionCookie(request, value: token),
+    HttpHeaders.setCookieHeader: _adminSessionCookie(
+      request,
+      value: token,
+      secure: secure,
+    ),
   };
 }
 
-Map<String, String> _clearAdminSessionCookieHeaders(Request request) {
+Map<String, String> _clearAdminSessionCookieHeaders(
+  Request request, {
+  required bool secure,
+}) {
   return <String, String>{
     HttpHeaders.setCookieHeader: _adminSessionCookie(
       request,
       value: '',
       clear: true,
+      secure: secure,
     ),
   };
 }
@@ -2597,6 +2678,7 @@ String _adminSessionCookie(
   Request request, {
   required String value,
   bool clear = false,
+  bool secure = false,
 }) {
   final parts = <String>[
     '$_adminSessionCookieName=${Uri.encodeComponent(value)}',
@@ -2605,7 +2687,7 @@ String _adminSessionCookie(
     'SameSite=Strict',
     clear ? 'Max-Age=0' : 'Max-Age=$_adminSessionMaxAgeSeconds',
   ];
-  if (_requestIsSecure(request)) {
+  if (secure || _requestIsSecure(request)) {
     parts.add('Secure');
   }
   return parts.join('; ');

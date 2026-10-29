@@ -57,6 +57,20 @@ void main() {
 
       expect(unknownEmailMessage, 'Email ou mot de passe incorrect.');
       expect(wrongPasswordMessage, unknownEmailMessage);
+      final unknownAdminEmailMessage = await _stateErrorMessage(
+        () => store.adminSignIn('admin-unknown-session', <String, dynamic>{
+          'email': 'unknown-admin@example.com',
+          'password': 'password123',
+        }),
+      );
+      final wrongAdminPasswordMessage = await _stateErrorMessage(
+        () => store.adminSignIn('admin-existing-session', <String, dynamic>{
+          'email': 'existing-user@example.com',
+          'password': 'wrong-password',
+        }),
+      );
+      expect(unknownAdminEmailMessage, wrongAdminPasswordMessage);
+      expect(unknownAdminEmailMessage, 'Email ou mot de passe incorrect.');
       expect(
         duplicateEmailMessage,
         'Impossible de créer le compte avec ces informations.',

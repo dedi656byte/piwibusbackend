@@ -1070,18 +1070,18 @@ class PiwibusStore {
       (user) => _text(user['email']).toLowerCase() == email,
     );
     if (index < 0) {
-      throw StateError('Compte administrateur introuvable.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
 
     final user = users[index];
     if (!_verifyPassword(email, password, _text(user['passwordHash']))) {
-      throw StateError('Mot de passe invalide.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
     if (_text(user['status']) == 'suspendu') {
-      throw StateError('Ce compte est suspendu.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
     if (!_userCanAdmin(user)) {
-      throw StateError('Acces administrateur requis.');
+      throw StateError('Email ou mot de passe incorrect.');
     }
 
     user['passwordHash'] = _hashPassword(email, password);
@@ -2828,6 +2828,14 @@ class PiwibusStore {
 
     final user = users[index];
     if (_text(user['status']) == 'suspendu') {
+      return generic;
+    }
+    final currentResetExpiry = DateTime.tryParse(
+      _text(user['passwordResetExpiresAt']),
+    );
+    if (_text(user['passwordResetHash']).isNotEmpty &&
+        currentResetExpiry != null &&
+        DateTime.now().toUtc().isBefore(currentResetExpiry.toUtc())) {
       return generic;
     }
     final code = _newPasswordResetCode();
@@ -7133,9 +7141,7 @@ class PiwibusStore {
       return BCrypt.checkpw(secret, bcryptHash);
     }
 
-    // Legacy fallback for old SHA-256 hashes. Will be replaced at next login.
-    final legacy = sha256.convert(utf8.encode(secret)).toString();
-    return storedHash == legacy;
+    return false;
   }
 
   static bool _isValidEmail(String email) {

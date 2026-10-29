@@ -24,6 +24,18 @@ void main() {
       expect(config.validateOrThrow, throwsStateError);
     });
 
+    test('requires secure cookies in production only', () {
+      final production = ProductionConfig.fromEnvironment(<String, String>{
+        'PIWIBUS_ENV': 'production',
+      });
+      final development = ProductionConfig.fromEnvironment(<String, String>{
+        'PIWIBUS_ENV': 'development',
+      });
+
+      expect(production.requiresSecureCookies, isTrue);
+      expect(development.requiresSecureCookies, isFalse);
+    });
+
     test('accepts an explicit development environment', () {
       final config = ProductionConfig.fromEnvironment(<String, String>{
         'PIWIBUS_ENV': 'development',
