@@ -130,6 +130,8 @@ Future<void> main(List<String> args) async {
         body: '$reason$locationText',
         data: <String, String>{
           'type': notificationType,
+          if (_string(notice['eventId']).isNotEmpty)
+            'eventId': _string(notice['eventId']),
           'tripId': tripId,
           'lineCode': _string(notice['lineCode']),
           'lineLabel': lineLabel,
@@ -364,6 +366,7 @@ Future<void> main(List<String> args) async {
             body: reason,
             data: <String, String>{
               'type': 'trip_stopped_admin',
+              'eventId': 'trip-stopped:$id',
               'tripId': id,
               'reason': reason,
             },
@@ -1027,6 +1030,8 @@ Future<void> main(List<String> args) async {
           if (audience.tokens.isNotEmpty) {
             final data = <String, String>{
               'type': 'message_created',
+              if (_string(message?['id']).isNotEmpty)
+                'eventId': 'message:$id:${_string(message?['id'])}',
               'conversationId': id,
               'messageId': _string(message?['id']),
               'senderId': _string(
@@ -1143,6 +1148,8 @@ Future<void> main(List<String> args) async {
       final snapshot = await store.startTrip(sessionId, body);
       sendTripCancellationNoticesFromSnapshot(snapshot);
       final lineCode = _string(body['lineCode']);
+      final tripId = _string(body['tripId']).trim();
+      final activityId = tripId.isEmpty ? null : 'trip-started-nearby:$tripId';
       final audience = store.notificationAudienceNearLine(lineCode);
       if (audience.sessionIds.isNotEmpty) {
         await store.publishActivity(
@@ -1150,6 +1157,7 @@ Future<void> main(List<String> args) async {
           subtitle: 'Un nouveau bus vient d’apparaître sur la ligne $lineCode.',
           iconKey: 'bus',
           colorValue: 0xFF0F766E,
+          activityId: activityId,
           audienceSessionIds: audience.sessionIds,
         );
       }
@@ -1158,7 +1166,12 @@ Future<void> main(List<String> args) async {
           tokens: audience.tokens,
           title: 'Nouveau bus sur la ligne',
           body: 'Un nouveau bus vient d’apparaître sur la ligne $lineCode.',
-          data: <String, String>{'type': 'trip_started', 'lineCode': lineCode},
+          data: <String, String>{
+            'type': 'trip_started',
+            'lineCode': lineCode,
+            if (tripId.isNotEmpty) 'tripId': tripId,
+            if (activityId != null) 'eventId': activityId,
+          },
         ),
       );
       return snapshot;
@@ -1232,7 +1245,11 @@ Future<void> main(List<String> args) async {
           tokens: audience.tokens,
           title: 'Nouvelle note',
           body: 'Votre trajet a reçu une nouvelle évaluation.',
-          data: <String, String>{'type': 'trip_rated', 'tripId': id},
+          data: <String, String>{
+            'type': 'trip_rated',
+            'eventId': store.tripRatingActivityId(sessionId, id),
+            'tripId': id,
+          },
         ),
       );
       return result;
@@ -1247,17 +1264,23 @@ Future<void> main(List<String> args) async {
       }
       final result = await store.setTripLike(sessionId, id, liked);
       if (result['tripLikeChanged'] == true && liked) {
+        final likeActivityId = _string(result['tripLikeActivityId']);
         final audience = store.notificationAudienceForTripOwner(id);
         unawaited(
           pushNotifications.sendToTokens(
             tokens: audience.tokens,
             title: 'Nouveau j\'aime',
             body: 'Votre trajet a reçu un nouveau j\'aime.',
-            data: <String, String>{'type': 'trip_liked', 'tripId': id},
+            data: <String, String>{
+              'type': 'trip_liked',
+              'eventId': likeActivityId,
+              'tripId': id,
+            },
           ),
         );
       }
       result.remove('tripLikeChanged');
+      result.remove('tripLikeActivityId');
       return result;
     });
   });
@@ -1266,6 +1289,8 @@ Future<void> main(List<String> args) async {
     final sessionId = await sessionIdFor(request);
     return _handleJson(request, jwtCodec, (body) async {
       final snapshot = await store.createReport(sessionId, body);
+      final reportId = _string(body['reportId']).trim();
+      final eventId = reportId.isEmpty ? null : 'report-nearby:$reportId';
       final lineCode = _string(body['lineCode']).isEmpty
           ? _string(snapshot['selectedLineCode'])
           : _string(body['lineCode']);
@@ -1277,6 +1302,7 @@ Future<void> main(List<String> args) async {
               'Une alerte sur la ligne $lineCode a été publiée à moins de 200 m.',
           iconKey: 'report',
           colorValue: 0xFFEE964B,
+          activityId: eventId,
           audienceSessionIds: audience.sessionIds,
         );
       }
@@ -1289,6 +1315,7 @@ Future<void> main(List<String> args) async {
           data: <String, String>{
             'type': 'report_created',
             'lineCode': lineCode,
+            if (eventId != null) 'eventId': eventId,
           },
         ),
       );

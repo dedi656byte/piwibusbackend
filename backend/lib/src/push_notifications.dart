@@ -50,6 +50,7 @@ class PushNotificationService {
     final authorizedClient = await _authorizedHttpClient();
     if (authorizedClient == null) return;
 
+    final eventId = data['eventId']?.trim() ?? '';
     for (final token in uniqueTokens) {
       try {
         final response = await authorizedClient.post(
@@ -68,6 +69,7 @@ class PushNotificationService {
                 'priority': 'HIGH',
                 'notification': <String, String>{
                   'channel_id': 'piwibus_custom',
+                  if (eventId.isNotEmpty) 'tag': eventId,
                 },
               },
             },

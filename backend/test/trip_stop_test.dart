@@ -49,6 +49,7 @@ void main() {
       expect(firstTrip['status'], 'termine');
       final stoppedAt = firstTrip['lastUpdatedAt'];
       expect(_stopActivityCount(firstStop), 1);
+      expect(_stopActivityId(firstStop), 'trip-stopped:$tripId');
 
       final duplicateStop = await store.stopTrip('trip-owner-session', tripId);
       final duplicateTrip = _tripFromSnapshot(duplicateStop, tripId);
@@ -137,6 +138,15 @@ int _stopActivityCount(Map<String, dynamic> snapshot) {
       .whereType<Map>()
       .where((value) => value['title'] == 'Trajet arrêté')
       .length;
+}
+
+String _stopActivityId(Map<String, dynamic> snapshot) {
+  final activity = snapshot['activity'] as List;
+  return _text(
+    activity.whereType<Map>().firstWhere(
+      (value) => value['title'] == 'Trajet arrêté',
+    )['id'],
+  );
 }
 
 Map<String, dynamic> _routePointLocation(JsonMap line) {

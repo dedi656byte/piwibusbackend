@@ -3487,6 +3487,7 @@ class PiwibusStore {
         iconKey: 'stop',
         colorValue: 0xFFD1495B,
         audienceSessionIds: _stringList(notice['audienceSessionIds']),
+        activityId: 'trip-stopped:${_text(notice['tripId'])}',
       );
     }
     addActivity(
@@ -3495,6 +3496,7 @@ class PiwibusStore {
       iconKey: 'play',
       colorValue: _colorValue(line['colour'], lineCode),
       audienceSessionIds: <String>[sessionId],
+      activityId: 'trip-started:$tripId',
     );
     final conversationChanged = ownerId.isNotEmpty;
     if (conversationChanged) {
@@ -3621,6 +3623,7 @@ class PiwibusStore {
         iconKey: 'stop',
         colorValue: 0xFFD1495B,
         audienceSessionIds: audienceSessionIds,
+        activityId: 'trip-interrupted:$tripId',
       );
       _state['trips'] = trips;
       _putSession(sessionId, session);
@@ -3762,6 +3765,7 @@ class PiwibusStore {
         iconKey: 'stop',
         colorValue: 0xFFD1495B,
         audienceSessionIds: audienceSessionIds,
+        activityId: 'trip-interrupted:$tripId',
       );
       notices.add(notice);
       tripsChanged = true;
@@ -3847,6 +3851,7 @@ class PiwibusStore {
         iconKey: 'stop',
         colorValue: 0xFFD1495B,
         audienceSessionIds: audience.sessionIds,
+        activityId: 'trip-interrupted:$tripId',
       );
       expiredNotices.add(<String, dynamic>{
         'notificationType': 'trip_stopped_timeout',
@@ -4011,6 +4016,7 @@ class PiwibusStore {
       iconKey: 'stop',
       colorValue: 0xFFD1495B,
       audienceSessionIds: activityAudience,
+      activityId: 'trip-stopped:$tripId',
     );
     _notifySharedChange();
     await _persist(
@@ -4054,6 +4060,9 @@ class PiwibusStore {
       createdAt,
       fieldName: 'Date du message',
     );
+    if (messages.any((message) => _text(message['id']) == effectiveMessageId)) {
+      return snapshot(sessionId);
+    }
     messages.add(
       _message(
         id: effectiveMessageId,
@@ -4079,6 +4088,7 @@ class PiwibusStore {
       iconKey: 'chat',
       colorValue: 0xFF0F766E,
       audienceSessionIds: activityAudience,
+      activityId: 'trip-message:$tripId:$effectiveMessageId',
     );
     _notifySharedChange();
     await _persist(const StateMutationBatch(trips: true, activity: true));
@@ -4119,6 +4129,7 @@ class PiwibusStore {
       iconKey: 'star',
       colorValue: 0xFFEE964B,
       audienceSessionIds: activityAudience,
+      activityId: tripRatingActivityId(sessionId, tripId),
     );
     _notifySharedChange();
     await _persist(const StateMutationBatch(trips: true, activity: true));
@@ -4158,6 +4169,9 @@ class PiwibusStore {
 
     trip['likedByActorIds'] = likedBy.toList(growable: false)..sort();
     _state['trips'] = trips;
+    final likeActivityId = liked
+        ? 'trip-liked:$tripId:${_newEntityId('like')}'
+        : null;
     if (liked) {
       final activityAudience = notificationAudienceForTripOwner(
         tripId,
@@ -4168,16 +4182,43 @@ class PiwibusStore {
         iconKey: 'heart',
         colorValue: 0xFFD1495B,
         audienceSessionIds: activityAudience,
+        activityId: likeActivityId,
       );
     }
     _notifySharedChange();
     await _persist(StateMutationBatch(trips: true, activity: liked));
-    return <String, dynamic>{...snapshot(sessionId), 'tripLikeChanged': liked};
+    return <String, dynamic>{
+      ...snapshot(sessionId),
+      'tripLikeChanged': liked,
+      if (likeActivityId != null) 'tripLikeActivityId': likeActivityId,
+    };
   }
 
   Future<JsonMap> createReport(String sessionId, JsonMap body) async {
     final session = _session(sessionId);
     final owner = _currentUser(session);
+    final requestedReportId = _clientIdOrEmpty(
+      body['reportId'],
+      fieldName: 'Identifiant signalement',
+    );
+    if (requestedReportId.isNotEmpty) {
+      final existingReport = _reports()
+          .where((report) => _text(report['id']) == requestedReportId)
+          .firstOrNull;
+      if (existingReport != null) {
+        final requesterId = _text(owner?['id']);
+        final sameAuthenticatedOwner =
+            requesterId.isNotEmpty &&
+            _text(existingReport['reporterId']) == requesterId;
+        final sameAnonymousSession =
+            requesterId.isEmpty &&
+            _text(existingReport['reporterSessionId']) == sessionId;
+        if (!sameAuthenticatedOwner && !sameAnonymousSession) {
+          throw StateError('Identifiant signalement déjà utilisé.');
+        }
+        return snapshot(sessionId);
+      }
+    }
     final busNumber = _boundedText(
       body['busNumber'],
       _maxBusNumberLength,
@@ -4206,13 +4247,10 @@ class PiwibusStore {
       ),
     };
     _putSession(sessionId, session);
-    final requestedReportId = _clientIdOrEmpty(
-      body['reportId'],
-      fieldName: 'Identifiant signalement',
-    );
     final reportId = requestedReportId.isEmpty
         ? _newEntityId('r')
         : requestedReportId;
+    final reports = _reports();
     final createdAt = _clientTimestampOrNow(
       body['createdAt'],
       fieldName: 'Date du signalement',
@@ -4233,6 +4271,7 @@ class PiwibusStore {
       ),
       'lineLabel': lineLabel.isEmpty ? 'Ligne inconnue' : lineLabel,
       'reporterId': _text(owner?['id']),
+      'reporterSessionId': sessionId,
       'reporterName':
           owner?['fullName'] ?? _roleLabel(_text(session['activeRole'])),
       'location': {'lat': parsedLocation['lat'], 'lng': parsedLocation['lng']},
@@ -4243,7 +4282,6 @@ class PiwibusStore {
           : note,
       'confidence': 0.78,
     };
-    final reports = _reports();
     reports.insert(0, report);
     _state['reports'] = reports;
     addActivity(
@@ -4252,6 +4290,7 @@ class PiwibusStore {
       iconKey: 'report',
       colorValue: 0xFF0F766E,
       audienceSessionIds: <String>[sessionId],
+      activityId: 'report-created:${_text(report['id'])}',
     );
     _notifySharedChange();
     await _persist(
@@ -5977,9 +6016,15 @@ class PiwibusStore {
         ? _double(location['lng'] ?? location['longitude'])
         : double.nan;
     final hasLastLocation = _isValidLatLng(lat, lng);
+    final activityId =
+        notificationType == 'trip_stopped_off_route' ||
+            notificationType == 'trip_stopped_timeout'
+        ? 'trip-interrupted:$tripId'
+        : 'trip-stopped:$tripId';
     return <String, dynamic>{
       'notificationType': notificationType,
       'tripId': tripId,
+      'eventId': activityId,
       'lineCode': lineCode,
       'lineLabel': busLabel,
       'reason': reason,
@@ -6457,6 +6502,7 @@ class PiwibusStore {
         iconKey: 'stop',
         colorValue: 0xFFD1495B,
         audienceSessionIds: _stringList(notice['audienceSessionIds']),
+        activityId: 'trip-stopped:$tripId',
       );
       notices.add(notice);
     }
@@ -6638,6 +6684,9 @@ class PiwibusStore {
     return userId.isEmpty ? _tripSessionLikeActorId(sessionId) : 'user-$userId';
   }
 
+  String tripRatingActivityId(String sessionId, String tripId) =>
+      'trip-rated:$tripId:${_tripRatingActorId(sessionId)}';
+
   List<String> _tripLikeActorIds(JsonMap trip) {
     final ids = _stringList(
       trip['likedByActorIds'] ?? trip['liked_by_actor_ids'],
@@ -6780,6 +6829,7 @@ class PiwibusStore {
     required String subtitle,
     required String iconKey,
     required int colorValue,
+    String? activityId,
     Iterable<String> audienceSessionIds = const <String>[],
     Iterable<String> audienceUserIds = const <String>[],
     bool isPublic = false,
@@ -6804,10 +6854,17 @@ class PiwibusStore {
       return;
     }
     final activity = _activityItems();
+    final normalizedActivityId = activityId?.trim() ?? '';
+    if (normalizedActivityId.isNotEmpty &&
+        activity.any((item) => _text(item['id']) == normalizedActivityId)) {
+      return;
+    }
     activity.insert(
       0,
       _activityEntry(
-        id: _newEntityId('act'),
+        id: normalizedActivityId.isEmpty
+            ? _newEntityId('act')
+            : normalizedActivityId,
         title: title,
         subtitle: subtitle,
         timestamp: _nowIso(),
@@ -6825,6 +6882,7 @@ class PiwibusStore {
     required String subtitle,
     required String iconKey,
     required int colorValue,
+    String? activityId,
     Iterable<String> audienceSessionIds = const <String>[],
     Iterable<String> audienceUserIds = const <String>[],
     bool isPublic = false,
@@ -6834,6 +6892,7 @@ class PiwibusStore {
       subtitle: subtitle,
       iconKey: iconKey,
       colorValue: colorValue,
+      activityId: activityId,
       audienceSessionIds: audienceSessionIds,
       audienceUserIds: audienceUserIds,
       isPublic: isPublic,
