@@ -205,7 +205,8 @@ class PostgresStatePersistence extends StatePersistence {
       SELECT
         id, sort_order, full_name, email, phone, profile_photo_data_url,
         name_changed_at, primary_role, status,
-        created_at, last_seen_at, password_hash, password_reset_hash,
+        created_at, last_seen_at, password_hash, google_subject,
+        password_reset_hash,
         password_reset_requested_at, password_reset_expires_at,
         password_reset_attempts, activity_read_at, read_alert_ids,
         star_trip_ids, followed_trip_ids
@@ -767,7 +768,8 @@ class PostgresStatePersistence extends StatePersistence {
             INSERT INTO piwibus_users (
               id, sort_order, full_name, email, phone, profile_photo_data_url,
               name_changed_at, primary_role, status,
-              created_at, last_seen_at, password_hash, password_reset_hash,
+              created_at, last_seen_at, password_hash, google_subject,
+              password_reset_hash,
               password_reset_requested_at, password_reset_expires_at,
               password_reset_attempts,
               activity_read_at, read_alert_ids,
@@ -777,7 +779,8 @@ class PostgresStatePersistence extends StatePersistence {
               @id, @sort_order, @full_name, @email, @phone,
               @profile_photo_data_url, @name_changed_at, @primary_role,
               @status, @created_at,
-              @last_seen_at, @password_hash, @password_reset_hash,
+              @last_seen_at, @password_hash, @google_subject,
+              @password_reset_hash,
               @password_reset_requested_at, @password_reset_expires_at,
               @password_reset_attempts, @activity_read_at, @read_alert_ids,
               @star_trip_ids,
@@ -795,6 +798,7 @@ class PostgresStatePersistence extends StatePersistence {
               created_at = EXCLUDED.created_at,
               last_seen_at = EXCLUDED.last_seen_at,
               password_hash = EXCLUDED.password_hash,
+              google_subject = EXCLUDED.google_subject,
               password_reset_hash = EXCLUDED.password_reset_hash,
               password_reset_requested_at = EXCLUDED.password_reset_requested_at,
               password_reset_expires_at = EXCLUDED.password_reset_expires_at,
@@ -817,6 +821,7 @@ class PostgresStatePersistence extends StatePersistence {
             'created_at': _dateTime(row['createdAt']),
             'last_seen_at': _nullableDateTime(row['lastSeenAt']),
             'password_hash': _text(row['passwordHash']),
+            'google_subject': _nullableText(row['googleSubject']),
             'password_reset_hash': _nullableText(row['passwordResetHash']),
             'password_reset_requested_at': _nullableDateTime(
               row['passwordResetRequestedAt'],
@@ -2536,6 +2541,21 @@ class PostgresStatePersistence extends StatePersistence {
         ''',
       ],
     );
+    await _applyMigration(
+      connection,
+      version: 23,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_users
+        ADD COLUMN IF NOT EXISTS google_subject text
+        ''',
+        '''
+        CREATE UNIQUE INDEX IF NOT EXISTS piwibus_users_google_subject_idx
+        ON piwibus_users (google_subject)
+        WHERE google_subject IS NOT NULL
+        ''',
+      ],
+    );
   }
 
   static Future<void> _applyMigration(
@@ -2646,6 +2666,7 @@ class PostgresStatePersistence extends StatePersistence {
           ? null
           : _iso(row['last_seen_at']),
       'passwordHash': _text(row['password_hash']),
+      'googleSubject': _text(row['google_subject']),
       'passwordResetHash': _text(row['password_reset_hash']),
       'passwordResetRequestedAt': row['password_reset_requested_at'] == null
           ? null

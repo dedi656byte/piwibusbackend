@@ -8,6 +8,7 @@ import 'package:crypto/crypto.dart';
 import 'package:bcrypt/bcrypt.dart';
 import 'package:path/path.dart' as p;
 
+import 'google_id_token_verifier.dart';
 import 'route_proximity.dart';
 import 'state_persistence.dart';
 
@@ -1586,7 +1587,6 @@ class PiwibusStore {
   }
 
   Future<JsonMap> signIn(String sessionId, JsonMap body) async {
-    final now = _nowIso();
     final email = _boundedText(
       body['email'],
       _maxEmailLength,
@@ -1622,8 +1622,86 @@ class PiwibusStore {
       throw StateError('Email ou mot de passe incorrect.');
     }
     user['passwordHash'] = hashed;
-    user['lastSeenAt'] = now;
+    return _completeUserSignIn(sessionId, user, users);
+  }
 
+  Future<JsonMap> signInWithGoogle(
+    String sessionId,
+    VerifiedGoogleIdentity identity,
+  ) async {
+    final subject = _boundedText(
+      identity.subject,
+      255,
+      fieldName: 'Identifiant Google',
+    );
+    final email = _boundedText(
+      identity.email,
+      _maxEmailLength,
+      fieldName: 'Email',
+    ).toLowerCase();
+    if (subject.isEmpty || !_isValidEmail(email)) {
+      throw StateError('Impossible de se connecter avec Google.');
+    }
+
+    final users = _users();
+    final linkedIndex = users.indexWhere(
+      (user) => _text(user['googleSubject']) == subject,
+    );
+    final emailIndex = users.indexWhere(
+      (user) => _text(user['email']).toLowerCase() == email,
+    );
+
+    JsonMap user;
+    if (linkedIndex >= 0) {
+      if (emailIndex >= 0 && emailIndex != linkedIndex) {
+        throw StateError('Impossible de se connecter avec Google.');
+      }
+      user = users[linkedIndex];
+    } else if (emailIndex >= 0) {
+      user = users[emailIndex];
+      final linkedSubject = _text(user['googleSubject']);
+      if (linkedSubject.isNotEmpty && linkedSubject != subject) {
+        throw StateError('Impossible de se connecter avec Google.');
+      }
+      user['googleSubject'] = subject;
+    } else {
+      final suppliedName = identity.fullName?.trim() ?? '';
+      final localPart = email.substring(0, email.indexOf('@'));
+      final fullName = _boundedText(
+        suppliedName.isEmpty ? localPart : suppliedName,
+        _maxNameLength,
+        fieldName: 'Nom complet',
+      );
+      if (fullName.isEmpty || _userNameExists(users, fullName)) {
+        throw StateError('Impossible de se connecter avec Google.');
+      }
+      user = _user(
+        id: _newEntityId('u'),
+        fullName: fullName,
+        email: email,
+        phone: '',
+        role: 'etoile',
+        status: 'actif',
+        passwordHash: '',
+        googleSubject: subject,
+        createdAt: _nowIso(),
+        lastSeenAt: _nowIso(),
+      );
+      users.insert(0, user);
+    }
+
+    if (_text(user['status']) == 'suspendu') {
+      throw StateError('Impossible de se connecter avec Google.');
+    }
+    return _completeUserSignIn(sessionId, user, users);
+  }
+
+  Future<JsonMap> _completeUserSignIn(
+    String sessionId,
+    JsonMap user,
+    List<JsonMap> users,
+  ) async {
+    user['lastSeenAt'] = _nowIso();
     _state['users'] = users;
     final session = _session(sessionId);
     session['currentUser'] = _publicUser(user);
@@ -1631,9 +1709,7 @@ class PiwibusStore {
     final adoptedTrips = _adoptSessionStarTrips(sessionId, user);
     session['currentUser'] = _publicUser(_storedUserOr(user));
     _putSession(sessionId, session);
-    // If there is already an active realtime connection for this session,
-    // ensure the normalized session reflects the fresh lastSeenAt and
-    // online status. Do not alter connection counts here.
+
     final currentCount = _sessionConnectionCounts[sessionId] ?? 0;
     if (currentCount > 0) {
       final sessions = _sessions();
@@ -4534,6 +4610,7 @@ class PiwibusStore {
     Iterable<String> readAlertIds = const <String>[],
     Iterable<String> starTripIds = const <String>[],
     Iterable<String> followedTripIds = const <String>[],
+    String? googleSubject,
   }) {
     return <String, dynamic>{
       'id': id,
@@ -4548,6 +4625,7 @@ class PiwibusStore {
       'createdAt': createdAt,
       'lastSeenAt': lastSeenAt,
       'passwordHash': passwordHash,
+      if (googleSubject != null) 'googleSubject': googleSubject,
       if (activityReadAt != null) 'activityReadAt': activityReadAt,
       'readAlertIds': readAlertIds.toList(growable: false),
       'starTripIds': starTripIds.toList(growable: false),
@@ -5540,6 +5618,7 @@ class PiwibusStore {
           ? null
           : _dateValue(input['lastSeenAt']),
       'passwordHash': _text(input['passwordHash']),
+      'googleSubject': _text(input['googleSubject'] ?? input['google_subject']),
       'passwordResetHash': _text(input['passwordResetHash']),
       'passwordResetRequestedAt': _dateValueOrNull(
         input['passwordResetRequestedAt'],

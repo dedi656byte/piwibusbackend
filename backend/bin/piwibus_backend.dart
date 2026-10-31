@@ -14,6 +14,7 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../lib/src/ops_logger.dart';
+import '../lib/src/google_id_token_verifier.dart';
 import '../lib/src/password_reset_email_service.dart';
 import '../lib/src/public_health.dart';
 import '../lib/src/production_config.dart';
@@ -69,6 +70,13 @@ Future<void> main(List<String> args) async {
   final redis = await RedisRealtime.openFromEnvironment(logger: logger);
 
   final store = await PiwibusStore.load();
+  final googleIdTokenVerifier = GoogleIdTokenVerifier(
+    audiences: (Platform.environment['PIWIBUS_GOOGLE_OAUTH_CLIENT_IDS'] ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toSet(),
+  );
   if (redis != null) {
     store.attachChangePublisher(redis.publishChange);
     store.listenToExternalChanges(redis.remoteChanges);
@@ -90,6 +98,7 @@ Future<void> main(List<String> args) async {
     trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS'),
     pathLimitsPerMinute: const <String, int>{
       'auth/sign-in': 10,
+      'auth/google/sign-in': 10,
       'admin/auth/login': 10,
       'auth/password-reset/request': 5,
       'auth/password-reset/request/': 5,
@@ -631,6 +640,41 @@ Future<void> main(List<String> args) async {
         (body) => store.signIn(sessionId, body),
         body: body,
       );
+    } catch (error) {
+      return _errorForException(error);
+    }
+  });
+  router.post('/auth/google/sign-in', (Request request) async {
+    try {
+      if (productionConfig.isProduction &&
+          request.requestedUri.scheme != 'https' &&
+          !(_envFlag('PIWIBUS_TRUST_PROXY_HEADERS') &&
+              _requestIsSecure(request))) {
+        return _error(
+          'La connexion Google exige une connexion HTTPS.',
+          statusCode: 400,
+        );
+      }
+      if (!googleIdTokenVerifier.isConfigured) {
+        return _error(
+          'La connexion Google n’est pas encore configurée.',
+          statusCode: 503,
+        );
+      }
+      final body = await _readJson(request);
+      final rawToken = body['idToken'];
+      if (rawToken is! String ||
+          rawToken.length > GoogleIdTokenVerifier.maxTokenLength) {
+        return _error('Jeton Google invalide.');
+      }
+
+      final identity = await googleIdTokenVerifier.verify(rawToken);
+      final sessionId = await sessionIdFor(request);
+      final snapshot = await store.signInWithGoogle(sessionId, identity);
+      return _json(_snapshotForRequest(request, snapshot, jwtCodec));
+    } on GoogleIdTokenVerificationException catch (error) {
+      final statusCode = googleIdTokenVerifier.isConfigured ? 401 : 503;
+      return _error(error.message, statusCode: statusCode);
     } catch (error) {
       return _errorForException(error);
     }
@@ -1388,6 +1432,7 @@ Future<void> main(List<String> args) async {
     await server.close(force: false);
     pushNotifications.close();
     mapTileClient.close();
+    await googleIdTokenVerifier.close();
     await redis?.close();
     await store.close();
     logger.info('Piwibus backend stopped');
