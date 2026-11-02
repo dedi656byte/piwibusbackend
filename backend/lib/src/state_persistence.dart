@@ -1255,7 +1255,7 @@ class PostgresStatePersistence extends StatePersistence {
                 ? null
                 : _dateTime(row['pinnedAt']),
             'attachment_data_url': _nullableText(row['attachmentDataUrl']),
-            'attachment_mime_type': _nullableText(row['attachmentMimeType']),
+            'attachment_mime_type': _text(row['attachmentMimeType']),
           },
           ignoreRows: true,
         );

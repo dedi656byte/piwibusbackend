@@ -84,9 +84,15 @@ void main() {
       store = await PiwibusStore.openWithPersistence(
         JsonFileStatePersistence(stateFile),
       );
+      final restoredMessages = store.conversationMessages(
+        'sender-session',
+        conversationId,
+      );
+      expect(restoredMessages, hasLength(1));
+      expect(restoredMessages.single['body'], 'Persist me after retry');
       expect(
-        store.conversationMessages('sender-session', conversationId),
-        hasLength(1),
+        restoredMessages.single.containsKey('attachmentMimeType'),
+        isFalse,
       );
     });
 
