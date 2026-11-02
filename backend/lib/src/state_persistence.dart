@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:piwibus_backend/src/ops_logger.dart';
 import 'package:path/path.dart' as p;
 import 'package:postgres/postgres.dart';
 
@@ -730,6 +731,16 @@ class PostgresStatePersistence extends StatePersistence {
         _loadedRevision = revision;
         onSuccess();
         return revision;
+      } on ServerException catch (error) {
+        const OpsLogger().error('PostgreSQL state transaction failed', {
+          'sqlState': error.code ?? 'unknown',
+          'severity': error.severity.name,
+          if (error.schemaName != null) 'schema': error.schemaName,
+          if (error.tableName != null) 'table': error.tableName,
+          if (error.columnName != null) 'column': error.columnName,
+          if (error.constraintName != null) 'constraint': error.constraintName,
+        });
+        rethrow;
       } finally {
         operationFinished.complete();
       }

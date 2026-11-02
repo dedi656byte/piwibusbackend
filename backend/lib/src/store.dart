@@ -189,6 +189,7 @@ class PiwibusStore {
   int _sharedRevision = 0;
   Future<void> Function()? _publishSharedChange;
   StreamSubscription<void>? _externalChangeSubscription;
+  Future<void> _messageSendOperations = Future<void>.value();
   int _activePersistenceWrites = 0;
   bool _externalReloadPending = false;
 
@@ -2299,6 +2300,24 @@ class PiwibusStore {
     String sessionId,
     String conversationId,
     JsonMap body,
+  ) {
+    final previousOperation = _messageSendOperations;
+    final operationFinished = Completer<void>();
+    _messageSendOperations = operationFinished.future;
+    return () async {
+      await previousOperation;
+      try {
+        return await _sendMessageItem(sessionId, conversationId, body);
+      } finally {
+        operationFinished.complete();
+      }
+    }();
+  }
+
+  Future<JsonMap> _sendMessageItem(
+    String sessionId,
+    String conversationId,
+    JsonMap body,
   ) async {
     final currentUserId = _authenticatedUserId(sessionId);
     final conversations = _messageConversations();
@@ -2409,34 +2428,43 @@ class PiwibusStore {
         ),
       },
     };
-    _advanceMessageRevision(conversation, message);
+    final updatedConversation = Map<String, dynamic>.from(conversation);
+    _advanceMessageRevision(updatedConversation, message);
     messages.add(message);
     final readSequences = _sequenceMap(conversation['readSequences']);
     readSequences[currentUserId] = nextSequence;
     final deliveredSequences = _sequenceMap(conversation['deliveredSequences']);
     deliveredSequences[currentUserId] = nextSequence;
-    conversation['messages'] = messages;
-    conversation['messageCursor'] = nextSequence;
-    conversation['readSequences'] = readSequences;
-    conversation['deliveredSequences'] = deliveredSequences;
-    conversation['lastMessagePreview'] = _messagePreview(
+    updatedConversation['messages'] = messages;
+    updatedConversation['messageCursor'] = nextSequence;
+    updatedConversation['readSequences'] = readSequences;
+    updatedConversation['deliveredSequences'] = deliveredSequences;
+    updatedConversation['lastMessagePreview'] = _messagePreview(
       text.trim().isEmpty ? 'Photo' : text,
     );
-    conversation['lastMessageId'] = effectiveMessageId;
-    conversation['lastSenderId'] = currentUserId;
-    conversation['updatedAt'] = createdAt;
-    conversations[index] = conversation;
-    _state['messageConversations'] = conversations;
+    updatedConversation['lastMessageId'] = effectiveMessageId;
+    updatedConversation['lastSenderId'] = currentUserId;
+    updatedConversation['updatedAt'] = createdAt;
+    final updatedConversations = List<JsonMap>.from(conversations)
+      ..[index] = updatedConversation;
+    final updatedState = <String, dynamic>{
+      ..._state,
+      'messageConversations': updatedConversations,
+    };
+    await _persist(
+      const StateMutationBatch(messageConversations: true),
+      state: updatedState,
+    );
+    _state = updatedState;
     _notifySharedChange();
-    await _persist(const StateMutationBatch(messageConversations: true));
     return <String, dynamic>{
       'message': _publicMessageItem(
         message,
         currentUserId: currentUserId,
-        tripOwnerUserId: _text(conversation['tripOwnerUserId']),
+        tripOwnerUserId: _text(updatedConversation['tripOwnerUserId']),
       ),
       'conversation': _publicMessageConversation(
-        conversation,
+        updatedConversation,
         currentUserId: currentUserId,
         usersById: _usersById(),
       ),
@@ -7057,10 +7085,10 @@ class PiwibusStore {
     await _persistence.saveState(_state);
   }
 
-  Future<void> _persist(StateMutationBatch batch) async {
+  Future<void> _persist(StateMutationBatch batch, {JsonMap? state}) async {
     _activePersistenceWrites += 1;
     try {
-      await _persistence.applyMutations(state: _state, batch: batch);
+      await _persistence.applyMutations(state: state ?? _state, batch: batch);
     } on ConcurrentStateMutationException catch (error, stackTrace) {
       await _reloadStateFromPersistence();
       _externalReloadPending = false;

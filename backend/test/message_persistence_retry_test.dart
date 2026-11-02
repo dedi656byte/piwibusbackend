@@ -49,6 +49,10 @@ void main() {
           (conversationResult['conversation'] as Map<String, dynamic>)['id']
               as String;
 
+      var publishedChanges = 0;
+      store.attachChangePublisher(() async {
+        publishedChanges += 1;
+      });
       persistence.failNextMessageWrite = true;
       final messageBody = <String, dynamic>{
         'body': 'Persist me after retry',
@@ -58,6 +62,11 @@ void main() {
       await expectLater(
         store.sendMessageItem('sender-session', conversationId, messageBody),
         throwsA(isA<StateError>()),
+      );
+      expect(publishedChanges, 0);
+      expect(
+        store.conversationMessages('sender-session', conversationId),
+        isEmpty,
       );
 
       final retry = await store.sendMessageItem(
@@ -69,6 +78,7 @@ void main() {
         (retry['message'] as Map<String, dynamic>)['id'],
         'retryable-message',
       );
+      expect(publishedChanges, 1);
 
       await store.close();
       store = await PiwibusStore.openWithPersistence(
@@ -79,6 +89,77 @@ void main() {
         hasLength(1),
       );
     });
+
+    test(
+      'concurrent sends persist both messages with distinct sequences',
+      () async {
+        await store.register('concurrent-sender-session', <String, dynamic>{
+          'fullName': 'Concurrent Sender',
+          'email': 'concurrent-sender@example.com',
+          'password': 'password123',
+        });
+        await store.register('concurrent-recipient-session', <String, dynamic>{
+          'fullName': 'Concurrent Recipient',
+          'email': 'concurrent-recipient@example.com',
+          'password': 'password123',
+        });
+        final recipientId =
+            (store.snapshot('concurrent-recipient-session')['currentUser']
+                    as Map<String, dynamic>)['id']
+                as String;
+        final conversationResult = await store.startMessageConversation(
+          'concurrent-sender-session',
+          <String, dynamic>{'peerUserId': recipientId},
+        );
+        final conversationId =
+            (conversationResult['conversation'] as Map<String, dynamic>)['id']
+                as String;
+
+        final results = await Future.wait(<Future<Map<String, dynamic>>>[
+          store.sendMessageItem(
+            'concurrent-sender-session',
+            conversationId,
+            <String, dynamic>{
+              'body': 'First concurrent message',
+              'messageId': 'concurrent-message-1',
+            },
+          ),
+          store.sendMessageItem(
+            'concurrent-sender-session',
+            conversationId,
+            <String, dynamic>{
+              'body': 'Second concurrent message',
+              'messageId': 'concurrent-message-2',
+            },
+          ),
+        ]);
+
+        expect(results, hasLength(2));
+        final messages = store.conversationMessages(
+          'concurrent-sender-session',
+          conversationId,
+        );
+        expect(messages.map((message) => message['id']).toSet(), {
+          'concurrent-message-1',
+          'concurrent-message-2',
+        });
+        expect(messages.map((message) => message['sequence']).toSet(), {1, 2});
+
+        await store.close();
+        store = await PiwibusStore.openWithPersistence(
+          JsonFileStatePersistence(stateFile),
+        );
+        final restoredMessages = store.conversationMessages(
+          'concurrent-sender-session',
+          conversationId,
+        );
+        expect(restoredMessages, hasLength(2));
+        expect(restoredMessages.map((message) => message['sequence']).toSet(), {
+          1,
+          2,
+        });
+      },
+    );
   });
 }
 
