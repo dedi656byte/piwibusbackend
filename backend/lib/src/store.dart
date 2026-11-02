@@ -474,20 +474,45 @@ class PiwibusStore {
   Future<void> _loadOrSeedState(File seedStateFile) async {
     final persisted = await _persistence.loadState();
     if (persisted != null) {
+      var conflictRetries = 0;
       try {
-        _state = _normalizeState(persisted);
-        _ensureBootstrapAdminFromEnv();
-        _enforceNoDefaultAdminPassword();
-        if (!_needsReseed(_state)) {
-          await _saveState();
-          return;
+        var stateToNormalize = persisted;
+        while (true) {
+          _state = _normalizeState(stateToNormalize);
+          _ensureBootstrapAdminFromEnv();
+          _enforceNoDefaultAdminPassword();
+          if (_needsReseed(_state)) break;
+
+          try {
+            await _saveState();
+            return;
+          } on ConcurrentStateMutationException {
+            if (!_persistence.isDatabaseBacked || conflictRetries >= 3) {
+              rethrow;
+            }
+            conflictRetries += 1;
+            await Future<void>.delayed(
+              Duration(milliseconds: 100 * conflictRetries),
+            );
+            final latestState = await _persistence.loadState();
+            if (latestState == null) {
+              throw StateError(
+                'Etat PostgreSQL absent apres un changement concurrent.',
+              );
+            }
+            stateToNormalize = latestState;
+          }
         }
       } catch (error) {
         if (_persistence.isDatabaseBacked) {
+          final cause = error is ConcurrentStateMutationException
+              ? 'Conflit de revision PostgreSQL apres '
+                    '$conflictRetries nouvelle(s) tentative(s).'
+              : error;
           throw StateError(
             'Etat PostgreSQL existant invalide ou impossible a normaliser. '
             'Demarrage interrompu pour eviter de remplacer les donnees par le seed. '
-            'Cause: $error',
+            'Cause: $cause',
           );
         }
         // Fall through to reseed for local JSON development state only.
