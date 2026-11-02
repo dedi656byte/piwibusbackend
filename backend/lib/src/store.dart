@@ -2317,6 +2317,7 @@ class PiwibusStore {
       orElse: () => <String, dynamic>{},
     );
     if (duplicate.isNotEmpty) {
+      await _persist(const StateMutationBatch(messageConversations: true));
       return <String, dynamic>{
         'message': _publicMessageItem(
           duplicate,
