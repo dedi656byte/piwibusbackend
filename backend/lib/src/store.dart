@@ -5340,7 +5340,7 @@ class PiwibusStore {
     final observerCounts = <String, int>{};
     for (final entry in _sessions().entries) {
       final session = _normalizeSession(entry.value);
-      if (!_sessionIsCurrentObserver(session)) continue;
+      if (!_sessionIsCurrentTripFollower(session)) continue;
       final selectedTripId = _text(session['selectedTripId']);
       if (!activeTripIds.contains(selectedTripId)) continue;
       final ownerId = ownerByTripId[selectedTripId] ?? '';
@@ -5412,10 +5412,7 @@ class PiwibusStore {
     trip['networkUsageBytes'] = _int(trip['networkUsageBytes']) + estimate;
   }
 
-  bool _sessionIsCurrentObserver(JsonMap session) {
-    if (_normalizeRole(session['activeRole']?.toString()) != 'observateur') {
-      return false;
-    }
+  bool _sessionIsCurrentTripFollower(JsonMap session) {
     final now = DateTime.now().toUtc();
     final location = session['currentLocation'];
     if (location is Map) {
