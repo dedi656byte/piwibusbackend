@@ -11,12 +11,14 @@ class RateLimiter {
     required RedisRealtime? redis,
     this.trustProxyHeaders = false,
     this.pathLimitsPerMinute = const <String, int>{},
+    this.onMemoryFallback,
   }) : _redis = redis;
 
   final int limitPerMinute;
   final RedisRealtime? _redis;
   final bool trustProxyHeaders;
   final Map<String, int> pathLimitsPerMinute;
+  final void Function()? onMemoryFallback;
   final Map<String, _RateLimitBucket> _buckets = <String, _RateLimitBucket>{};
 
   Middleware middleware() {
@@ -72,6 +74,7 @@ class RateLimiter {
         window: const Duration(seconds: 75),
       );
       if (count != null) return count <= limit;
+      onMemoryFallback?.call();
     }
     return _checkInMemory('$namespace:$key', limit);
   }

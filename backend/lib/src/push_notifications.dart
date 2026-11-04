@@ -41,16 +41,31 @@ class PushNotificationService {
     required String body,
     Map<String, String> data = const <String, String>{},
   }) async {
+    await sendToTokensWithResult(
+      tokens: tokens,
+      title: title,
+      body: body,
+      data: data,
+    );
+  }
+
+  Future<bool> sendToTokensWithResult({
+    required Iterable<String> tokens,
+    required String title,
+    required String body,
+    Map<String, String> data = const <String, String>{},
+  }) async {
     final uniqueTokens = tokens
         .map((token) => token.trim())
         .where((token) => token.isNotEmpty)
         .toSet();
-    if (!enabled || uniqueTokens.isEmpty) return;
+    if (!enabled || uniqueTokens.isEmpty) return true;
 
     final authorizedClient = await _authorizedHttpClient();
-    if (authorizedClient == null) return;
+    if (authorizedClient == null) return false;
 
     final eventId = data['eventId']?.trim() ?? '';
+    var succeeded = true;
     for (final token in uniqueTokens) {
       try {
         final response = await authorizedClient.post(
@@ -72,19 +87,26 @@ class PushNotificationService {
                   if (eventId.isNotEmpty) 'tag': eventId,
                 },
               },
+              if (eventId.isNotEmpty)
+                'apns': <String, Object?>{
+                  'headers': <String, String>{'apns-collapse-id': eventId},
+                },
             },
           }),
         );
         if (response.statusCode < 200 || response.statusCode >= 300) {
+          succeeded = false;
           logger.warning('FCM push failed', <String, Object?>{
             'statusCode': response.statusCode,
             'body': response.body,
           });
         }
       } catch (error, stackTrace) {
+        succeeded = false;
         logger.error('FCM push exception', const {}, error, stackTrace);
       }
     }
+    return succeeded;
   }
 
   Future<http.Client?> _authorizedHttpClient() async {

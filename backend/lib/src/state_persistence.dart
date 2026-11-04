@@ -23,6 +23,7 @@ class StateMutationBatch {
     this.pushTokens = false,
     this.activity = false,
     this.messageConversations = false,
+    this.outboxEvents = const <StateOutboxEvent>[],
   });
 
   final bool users;
@@ -32,6 +33,7 @@ class StateMutationBatch {
   final bool pushTokens;
   final bool activity;
   final bool messageConversations;
+  final List<StateOutboxEvent> outboxEvents;
 
   bool get isEmpty =>
       !users &&
@@ -40,7 +42,22 @@ class StateMutationBatch {
       !reports &&
       !pushTokens &&
       !activity &&
-      !messageConversations;
+      !messageConversations &&
+      outboxEvents.isEmpty;
+}
+
+class StateOutboxEvent {
+  const StateOutboxEvent({
+    required this.id,
+    required this.type,
+    required this.payload,
+    this.attempts = 0,
+  });
+
+  final String id;
+  final String type;
+  final Map<String, dynamic> payload;
+  final int attempts;
 }
 
 abstract class StatePersistence {
@@ -55,6 +72,30 @@ abstract class StatePersistence {
   Future<void> checkReady() async {}
 
   Future<bool> hasExternalChanges() async => false;
+
+  Future<List<StateOutboxEvent>> claimOutboxEvents({
+    required String workerId,
+    required String type,
+    int limit = 50,
+    Duration lease = const Duration(seconds: 30),
+  }) async => const <StateOutboxEvent>[];
+
+  Future<void> markOutboxEventPublished({
+    required String workerId,
+    required String eventId,
+  }) async {}
+
+  Future<void> retryOutboxEvent({
+    required String workerId,
+    required String eventId,
+    required String error,
+    Duration delay = const Duration(seconds: 5),
+    int maxAttempts = 8,
+  }) async {}
+
+  Future<int> prunePublishedOutboxEvents({
+    Duration olderThan = const Duration(days: 7),
+  }) async => 0;
 
   Future<void> applyMutations({
     required Map<String, dynamic> state,
@@ -128,11 +169,14 @@ class PostgresStatePersistence extends StatePersistence {
   PostgresStatePersistence._({
     required Pool<dynamic> connection,
     required bool postgisAvailable,
+    required bool outboxEnabled,
   }) : _connection = connection,
-       _postgisAvailable = postgisAvailable;
+       _postgisAvailable = postgisAvailable,
+       _outboxEnabled = outboxEnabled;
 
   final Pool<dynamic> _connection;
   final bool _postgisAvailable;
+  final bool _outboxEnabled;
   Future<void> _transactionOperations = Future<void>.value();
   bool _closed = false;
 
@@ -179,6 +223,159 @@ class PostgresStatePersistence extends StatePersistence {
     return revision != _loadedRevision;
   }
 
+  @override
+  Future<List<StateOutboxEvent>> claimOutboxEvents({
+    required String workerId,
+    required String type,
+    int limit = 50,
+    Duration lease = const Duration(seconds: 30),
+  }) async {
+    if (!_outboxEnabled) return const <StateOutboxEvent>[];
+    final boundedLimit = limit.clamp(1, 200).toInt();
+    final leaseSeconds = lease.inSeconds.clamp(1, 300).toInt();
+    return _withConnectionRetry((connection) {
+      return connection.runTx((session) async {
+        final result = await session.execute(
+          Sql.named('''
+            WITH candidates AS (
+              SELECT id
+              FROM piwibus_outbox
+              WHERE event_type = @event_type
+                AND available_at <= now()
+                AND (
+                  status = 'pending'
+                  OR (status = 'processing' AND lease_until <= now())
+                )
+              ORDER BY created_at, id
+              FOR UPDATE SKIP LOCKED
+              LIMIT @limit
+            )
+            UPDATE piwibus_outbox AS events
+            SET status = 'processing',
+                attempts = events.attempts + 1,
+                lease_owner = @worker_id,
+                lease_until = now() + make_interval(secs => @lease_seconds)
+            FROM candidates
+            WHERE events.id = candidates.id
+            RETURNING
+              events.event_id, events.event_type, events.payload,
+              events.attempts
+          '''),
+          parameters: <String, Object?>{
+            'event_type': type,
+            'limit': boundedLimit,
+            'worker_id': workerId,
+            'lease_seconds': leaseSeconds,
+          },
+        );
+        return result
+            .map((row) {
+              final values = row.toColumnMap();
+              final rawPayload = values['payload'];
+              final payload = rawPayload is Map
+                  ? Map<String, dynamic>.from(rawPayload)
+                  : rawPayload is String
+                  ? _jsonMapOrNull(rawPayload) ?? <String, dynamic>{}
+                  : <String, dynamic>{};
+              return StateOutboxEvent(
+                id: _text(values['event_id']),
+                type: _text(values['event_type']),
+                payload: payload,
+                attempts: _int(values['attempts']),
+              );
+            })
+            .toList(growable: false);
+      });
+    });
+  }
+
+  @override
+  Future<void> markOutboxEventPublished({
+    required String workerId,
+    required String eventId,
+  }) async {
+    if (!_outboxEnabled) return;
+    await _withConnectionRetry((connection) async {
+      final result = await connection.execute(
+        Sql.named('''
+          UPDATE piwibus_outbox
+          SET status = 'published',
+              published_at = now(),
+              lease_owner = NULL,
+              lease_until = NULL,
+              last_error = NULL
+          WHERE event_id = @event_id
+            AND status = 'processing'
+            AND lease_owner = @worker_id
+        '''),
+        parameters: <String, Object?>{
+          'event_id': eventId,
+          'worker_id': workerId,
+        },
+      );
+      if (result.affectedRows == 0) {
+        throw StateError('Outbox lease was lost before event acknowledgement.');
+      }
+    });
+  }
+
+  @override
+  Future<void> retryOutboxEvent({
+    required String workerId,
+    required String eventId,
+    required String error,
+    Duration delay = const Duration(seconds: 5),
+    int maxAttempts = 8,
+  }) async {
+    if (!_outboxEnabled) return;
+    await _withConnectionRetry((connection) async {
+      await connection.execute(
+        Sql.named('''
+          UPDATE piwibus_outbox
+          SET status = CASE
+                WHEN attempts >= @max_attempts THEN 'dead_letter'
+                ELSE 'pending'
+              END,
+              available_at = now() + make_interval(secs => @delay_seconds),
+              lease_owner = NULL,
+              lease_until = NULL,
+              last_error = @last_error
+          WHERE event_id = @event_id
+            AND status = 'processing'
+            AND lease_owner = @worker_id
+        '''),
+        parameters: <String, Object?>{
+          'event_id': eventId,
+          'worker_id': workerId,
+          'delay_seconds': delay.inSeconds.clamp(1, 3600),
+          'max_attempts': maxAttempts.clamp(1, 100),
+          'last_error': error.length > 1000 ? error.substring(0, 1000) : error,
+        },
+        ignoreRows: true,
+      );
+    });
+  }
+
+  @override
+  Future<int> prunePublishedOutboxEvents({
+    Duration olderThan = const Duration(days: 7),
+  }) async {
+    if (!_outboxEnabled) return 0;
+    return _withConnectionRetry((connection) async {
+      final result = await connection.execute(
+        Sql.named('''
+          DELETE FROM piwibus_outbox
+          WHERE status = 'published'
+            AND published_at < now() - make_interval(secs => @age_seconds)
+        '''),
+        parameters: <String, Object?>{
+          'age_seconds': olderThan.inSeconds.clamp(86400, 31536000),
+        },
+      );
+      return result.affectedRows;
+    });
+  }
+
   static Future<PostgresStatePersistence> open(String databaseUrl) async {
     final normalizedDatabaseUrl = _withDefaultPoolSettings(databaseUrl);
     final connection = Pool<dynamic>.withUrl(normalizedDatabaseUrl);
@@ -190,6 +387,12 @@ class PostgresStatePersistence extends StatePersistence {
     final persistence = PostgresStatePersistence._(
       connection: connection,
       postgisAvailable: postgisAvailable,
+      outboxEnabled:
+          (Platform.environment['PIWIBUS_REDIS_URL'] ??
+                  Platform.environment['REDIS_URL'] ??
+                  '')
+              .trim()
+              .isNotEmpty,
     );
     await persistence._migrateLegacyStateIfNeeded();
     return persistence;
@@ -558,7 +761,11 @@ class PostgresStatePersistence extends StatePersistence {
           _mapList(state['messageConversations']),
         );
       }
-      return _bumpRevisionAndNotify(session, expectedRevision: _loadedRevision);
+      return _bumpRevisionAndNotify(
+        session,
+        expectedRevision: _loadedRevision,
+        outboxEvents: batch.outboxEvents,
+      );
     }, onSuccess: () => _refreshFingerprintsFromState(state, batch: batch));
   }
 
@@ -1439,6 +1646,7 @@ class PostgresStatePersistence extends StatePersistence {
   Future<int> _bumpRevisionAndNotify(
     TxSession session, {
     required int expectedRevision,
+    List<StateOutboxEvent> outboxEvents = const <StateOutboxEvent>[],
   }) async {
     final result = await session.execute(
       Sql.named('''
@@ -1456,6 +1664,21 @@ class PostgresStatePersistence extends StatePersistence {
     if (result.isEmpty) {
       throw const ConcurrentStateMutationException();
     }
+    final revision =
+        int.tryParse(result.first[0].toString()) ?? expectedRevision + 1;
+    if (_outboxEnabled) {
+      await _insertOutboxEvent(
+        session,
+        StateOutboxEvent(
+          id: 'state:$revision',
+          type: 'state_changed',
+          payload: <String, dynamic>{'revision': revision},
+        ),
+      );
+      for (final event in outboxEvents) {
+        await _insertOutboxEvent(session, event);
+      }
+    }
     await session.execute(
       Sql.named("SELECT pg_notify('piwibus_state_changed', @payload)"),
       parameters: <String, Object?>{
@@ -1463,7 +1686,31 @@ class PostgresStatePersistence extends StatePersistence {
       },
       ignoreRows: true,
     );
-    return int.tryParse(result.first[0].toString()) ?? expectedRevision + 1;
+    return revision;
+  }
+
+  Future<void> _insertOutboxEvent(
+    TxSession session,
+    StateOutboxEvent event,
+  ) async {
+    final eventId = event.id.trim();
+    final eventType = event.type.trim();
+    if (eventId.isEmpty || eventType.isEmpty) {
+      throw StateError('Outbox events require an id and type.');
+    }
+    await session.execute(
+      Sql.named('''
+        INSERT INTO piwibus_outbox (event_id, event_type, payload)
+        VALUES (@event_id, @event_type, CAST(@payload AS jsonb))
+        ON CONFLICT (event_id) DO NOTHING
+      '''),
+      parameters: <String, Object?>{
+        'event_id': eventId,
+        'event_type': eventType,
+        'payload': jsonEncode(event.payload),
+      },
+      ignoreRows: true,
+    );
   }
 
   Future<void> _syncKeyedCollection({
@@ -2564,6 +2811,33 @@ class PostgresStatePersistence extends StatePersistence {
         CREATE UNIQUE INDEX IF NOT EXISTS piwibus_users_google_subject_idx
         ON piwibus_users (google_subject)
         WHERE google_subject IS NOT NULL
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 24,
+      statements: const <String>[
+        '''
+        CREATE TABLE IF NOT EXISTS piwibus_outbox (
+          event_id text PRIMARY KEY,
+          event_type text NOT NULL,
+          payload jsonb NOT NULL,
+          status text NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'processing', 'published', 'dead_letter')),
+          attempts integer NOT NULL DEFAULT 0,
+          available_at timestamptz NOT NULL DEFAULT now(),
+          lease_owner text,
+          lease_until timestamptz,
+          published_at timestamptz,
+          last_error text,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS piwibus_outbox_pending_idx
+        ON piwibus_outbox (event_type, available_at, created_at)
+        WHERE status IN ('pending', 'processing')
         ''',
       ],
     );

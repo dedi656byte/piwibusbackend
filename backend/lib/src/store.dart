@@ -212,6 +212,37 @@ class PiwibusStore {
     _setSessionOnline(sessionId, false);
   }
 
+  void syncOnlineSessions(Set<String> onlineSessionIds) {
+    final normalizedOnlineIds =
+        onlineSessionIds
+            .map((id) => id.trim())
+            .where((id) => id.isNotEmpty)
+            .toSet()
+          ..addAll(
+            _sessionConnectionCounts.entries
+                .where((entry) => entry.value > 0)
+                .map((entry) => entry.key),
+          );
+    final sessions = _sessions();
+    var changed = false;
+    for (final entry in sessions.entries) {
+      final online = normalizedOnlineIds.contains(entry.key);
+      final wasOnline = _sessionOnline.containsKey(entry.key);
+      if (online == wasOnline) continue;
+      if (online) {
+        _sessionOnline[entry.key] = true;
+      } else {
+        _sessionOnline.remove(entry.key);
+      }
+      final normalized = _normalizeSession(entry.value);
+      normalized['isOnline'] = online;
+      if (online) normalized['lastSeenAt'] = _nowIso();
+      _putSession(entry.key, normalized);
+      changed = true;
+    }
+    if (changed) _notifySharedChange(committed: true);
+  }
+
   void _setSessionOnline(String sessionId, bool online) {
     final currentCount = _sessionConnectionCounts[sessionId] ?? 0;
     if (online) {
@@ -238,7 +269,7 @@ class PiwibusStore {
       _putSession(sessionId, normalized);
     }
 
-    _notifySharedChange();
+    _notifySharedChange(committed: true);
   }
 
   void attachChangePublisher(Future<void> Function() publishSharedChange) {
@@ -248,15 +279,65 @@ class PiwibusStore {
   void listenToExternalChanges(Stream<void> changes) {
     _externalChangeSubscription?.cancel();
     _externalChangeSubscription = changes.listen((_) async {
-      if (_activePersistenceWrites > 0) {
-        _externalReloadPending = true;
-        return;
-      }
-      if (await _persistence.hasExternalChanges()) {
-        await _reloadStateFromPersistence();
-      }
-      _notifySharedChange(publishExternal: false);
+      await refreshFromPersistence();
     });
+  }
+
+  Future<void> refreshFromPersistence() async {
+    if (_activePersistenceWrites > 0) {
+      _externalReloadPending = true;
+      return;
+    }
+    if (await _persistence.hasExternalChanges()) {
+      await _reloadStateFromPersistence();
+      _notifySharedChange(committed: true);
+    }
+  }
+
+  Future<List<StateOutboxEvent>> claimOutboxEvents({
+    required String workerId,
+    required String type,
+    int limit = 50,
+    Duration lease = const Duration(seconds: 30),
+  }) {
+    return _persistence.claimOutboxEvents(
+      workerId: workerId,
+      type: type,
+      limit: limit,
+      lease: lease,
+    );
+  }
+
+  Future<void> markOutboxEventPublished({
+    required String workerId,
+    required String eventId,
+  }) {
+    return _persistence.markOutboxEventPublished(
+      workerId: workerId,
+      eventId: eventId,
+    );
+  }
+
+  Future<void> retryOutboxEvent({
+    required String workerId,
+    required String eventId,
+    required String error,
+    Duration delay = const Duration(seconds: 5),
+    int maxAttempts = 8,
+  }) {
+    return _persistence.retryOutboxEvent(
+      workerId: workerId,
+      eventId: eventId,
+      error: error,
+      delay: delay,
+      maxAttempts: maxAttempts,
+    );
+  }
+
+  Future<int> prunePublishedOutboxEvents({
+    Duration olderThan = const Duration(days: 7),
+  }) {
+    return _persistence.prunePublishedOutboxEvents(olderThan: olderThan);
   }
 
   static Future<PiwibusStore> load() async {
@@ -877,6 +958,91 @@ class PiwibusStore {
         .toSet()
         .toList(growable: false);
     return (tokens: tokens, sessionIds: sessionIds);
+  }
+
+  StateOutboxEvent? createPushOutboxEvent({
+    required String eventId,
+    required String title,
+    required String body,
+    required Map<String, String> data,
+    Iterable<String> audienceSessionIds = const <String>[],
+    Iterable<String> audienceUserIds = const <String>[],
+  }) {
+    final sessionIds = audienceSessionIds
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final userIds = <String>{
+      ...audienceUserIds.map((id) => id.trim()).where((id) => id.isNotEmpty),
+      ..._userIdsForSessionAudience(sessionIds),
+    };
+    final anonymousSessionIds = sessionIds.where((sessionId) {
+      final currentUser = _sessions()[sessionId]?['currentUser'];
+      return currentUser is! Map || _text(currentUser['id']).isEmpty;
+    }).toSet();
+    if (userIds.isEmpty && anonymousSessionIds.isEmpty) return null;
+    final stableEventId = eventId.trim();
+    if (stableEventId.isEmpty) {
+      throw StateError('A push outbox event requires a stable eventId.');
+    }
+    return StateOutboxEvent(
+      id: 'push:$stableEventId',
+      type: 'push_notification',
+      payload: <String, dynamic>{
+        'eventId': stableEventId,
+        'title': title,
+        'body': body,
+        'data': <String, String>{...data, 'eventId': stableEventId},
+        'recipientUserIds': userIds.toList(growable: false),
+        'recipientSessionIds': anonymousSessionIds.toList(growable: false),
+      },
+    );
+  }
+
+  String newPushEventId() => _newEntityId('push-event');
+
+  StateOutboxEvent? pushEventForTripCancellation(JsonMap notice) {
+    final tripId = _text(notice['tripId']);
+    final eventId = _text(notice['eventId']);
+    if (tripId.isEmpty || eventId.isEmpty) return null;
+    final lineCode = _text(notice['lineCode']);
+    return createPushOutboxEvent(
+      eventId: eventId,
+      title: 'Trajet ${_text(notice['lineLabel'])} interrompu',
+      body: _text(notice['reason']),
+      data: <String, String>{
+        'type': _text(notice['notificationType']).isEmpty
+            ? 'trip_stopped_system'
+            : _text(notice['notificationType']),
+        'tripId': tripId,
+        'lineCode': lineCode,
+        'lineLabel': _text(notice['lineLabel']),
+        'reason': _text(notice['reason']),
+      },
+      audienceSessionIds: _stringList(notice['audienceSessionIds']),
+    );
+  }
+
+  List<String> pushTokensForOutboxEvent(Map<String, dynamic> payload) {
+    final tokens = <String>{};
+    final userIds = payload['recipientUserIds'];
+    if (userIds is Iterable) {
+      for (final userId in userIds) {
+        tokens.addAll(notificationAudienceForUser(_text(userId)).tokens);
+      }
+    }
+    final sessionIds = payload['recipientSessionIds'];
+    if (sessionIds is Iterable) {
+      final targets = sessionIds.map(_text).toSet();
+      tokens.addAll(
+        _mapList(_state['pushTokens'])
+            .where((token) => _text(token['status']) != 'disabled')
+            .where((token) => targets.contains(_text(token['sessionId'])))
+            .map((token) => _text(token['token']))
+            .where((token) => token.isNotEmpty),
+      );
+    }
+    return tokens.toList(growable: false);
   }
 
   JsonMap? lastMessageForConversation(String conversationId) {
@@ -1597,6 +1763,8 @@ class PiwibusStore {
     required String title,
     required String body,
     required String targetLabel,
+    required String eventId,
+    required Map<String, String> data,
     Iterable<String> audienceSessionIds = const <String>[],
   }) async {
     _requireAdmin(sessionId);
@@ -1606,9 +1774,22 @@ class PiwibusStore {
       iconKey: 'notification',
       colorValue: 0xFF0F766E,
       audienceSessionIds: audienceSessionIds,
+      activityId: eventId,
+    );
+    final pushEvent = createPushOutboxEvent(
+      eventId: eventId,
+      title: title,
+      body: body,
+      data: data,
+      audienceSessionIds: audienceSessionIds,
     );
     _notifySharedChange();
-    await _persist(const StateMutationBatch(activity: true));
+    await _persist(
+      StateMutationBatch(
+        activity: true,
+        outboxEvents: <StateOutboxEvent>[if (pushEvent != null) pushEvent],
+      ),
+    );
     return adminDashboard(sessionId);
   }
 
@@ -2451,8 +2632,29 @@ class PiwibusStore {
       ..._state,
       'messageConversations': updatedConversations,
     };
+    final recipientUserIds = participantIds
+        .where((participantId) => participantId != currentUserId)
+        .toList(growable: false);
+    final messagePushEvent = createPushOutboxEvent(
+      eventId: 'message:$conversationId:$effectiveMessageId',
+      title: 'Nouveau message',
+      body: 'Vous avez reçu un nouveau message',
+      data: <String, String>{
+        'type': 'message_created',
+        'conversationId': conversationId,
+        'messageId': effectiveMessageId,
+        'senderId': currentUserId,
+        'createdAt': createdAt,
+      },
+      audienceUserIds: recipientUserIds,
+    );
     await _persist(
-      const StateMutationBatch(messageConversations: true),
+      StateMutationBatch(
+        messageConversations: true,
+        outboxEvents: <StateOutboxEvent>[
+          if (messagePushEvent != null) messagePushEvent,
+        ],
+      ),
       state: updatedState,
     );
     _state = updatedState;
@@ -2468,9 +2670,7 @@ class PiwibusStore {
         currentUserId: currentUserId,
         usersById: _usersById(),
       ),
-      'recipientUserIds': participantIds
-          .where((participantId) => participantId != currentUserId)
-          .toList(growable: false),
+      'recipientUserIds': recipientUserIds,
     };
   }
 
@@ -3097,11 +3297,16 @@ class PiwibusStore {
     if (stoppedOwnedTripNotices.isNotEmpty) {
       _notifySharedChange();
     }
+    final cancellationPushEvents = stoppedOwnedTripNotices
+        .map(pushEventForTripCancellation)
+        .whereType<StateOutboxEvent>()
+        .toList(growable: false);
     await _persist(
       StateMutationBatch(
         sessions: true,
         trips: stoppedOwnedTripNotices.isNotEmpty,
         activity: stoppedOwnedTripNotices.isNotEmpty,
+        outboxEvents: cancellationPushEvents,
       ),
     );
     return _snapshotWithSystemTripCancellationNotices(
@@ -3632,6 +3837,22 @@ class PiwibusStore {
     if (conversationChanged) {
       _ensureTripConversationForUser(ownerId, trip);
     }
+    final nearbyAudience = notificationAudienceNearLine(lineCode);
+    final startPushEvent = createPushOutboxEvent(
+      eventId: 'trip-started-nearby:$tripId',
+      title: 'Nouveau bus sur la ligne',
+      body: 'Un nouveau bus vient d’apparaître sur la ligne $lineCode.',
+      data: <String, String>{
+        'type': 'trip_started',
+        'lineCode': lineCode,
+        'tripId': tripId,
+      },
+      audienceSessionIds: nearbyAudience.sessionIds,
+    );
+    final cancellationPushEvents = stoppedOwnedTripNotices
+        .map(pushEventForTripCancellation)
+        .whereType<StateOutboxEvent>()
+        .toList(growable: false);
     _notifySharedChange();
     await _persist(
       StateMutationBatch(
@@ -3640,6 +3861,10 @@ class PiwibusStore {
         sessions: true,
         activity: true,
         messageConversations: conversationChanged,
+        outboxEvents: <StateOutboxEvent>[
+          ...cancellationPushEvents,
+          if (startPushEvent != null) startPushEvent,
+        ],
       ),
     );
     return _snapshotWithSystemTripCancellationNotices(
@@ -3761,12 +3986,16 @@ class PiwibusStore {
           _rememberStarTripForOwner(trip) ||
           _rememberStarTripForSessionOwner(sessionId, session, trip);
       _notifySharedChange();
+      final cancellationPushEvent = pushEventForTripCancellation(notice);
       await _persist(
         StateMutationBatch(
           users: starHistoryChanged,
           trips: true,
           sessions: true,
           activity: true,
+          outboxEvents: <StateOutboxEvent>[
+            if (cancellationPushEvent != null) cancellationPushEvent,
+          ],
         ),
       );
       throw SystemTripCancellationException(
@@ -3907,12 +4136,17 @@ class PiwibusStore {
       _state['sessions'] = sessions;
       _notifySharedChange();
     }
+    final cancellationPushEvents = notices
+        .map(pushEventForTripCancellation)
+        .whereType<StateOutboxEvent>()
+        .toList(growable: false);
     await _persist(
       StateMutationBatch(
         users: usersChanged,
         trips: true,
         sessions: notices.isNotEmpty,
         activity: notices.isNotEmpty,
+        outboxEvents: cancellationPushEvents,
       ),
     );
     return notices;
@@ -3996,12 +4230,20 @@ class PiwibusStore {
         'audienceSessionIds': audience.sessionIds.toList(growable: false),
       });
     }
-
     if (expiredNotices.isEmpty) return const <JsonMap>[];
     _state['trips'] = trips;
+    final cancellationPushEvents = expiredNotices
+        .map(pushEventForTripCancellation)
+        .whereType<StateOutboxEvent>()
+        .toList(growable: false);
     _notifySharedChange();
     await _persist(
-      StateMutationBatch(users: usersChanged, trips: true, activity: true),
+      StateMutationBatch(
+        users: usersChanged,
+        trips: true,
+        activity: true,
+        outboxEvents: cancellationPushEvents,
+      ),
     );
     return expiredNotices;
   }
@@ -4148,6 +4390,15 @@ class PiwibusStore {
       audienceSessionIds: activityAudience,
       activityId: 'trip-stopped:$tripId',
     );
+    final stopPushEvent = pushEventForTripCancellation(
+      _systemTripCancellationNotice(
+        stoppedTrip!,
+        reason: stopReason,
+        notificationType: stoppedByOwner
+            ? 'trip_stopped'
+            : 'trip_stopped_admin',
+      ),
+    );
     _notifySharedChange();
     await _persist(
       StateMutationBatch(
@@ -4155,6 +4406,9 @@ class PiwibusStore {
         trips: true,
         sessions: true,
         activity: true,
+        outboxEvents: <StateOutboxEvent>[
+          if (stopPushEvent != null) stopPushEvent,
+        ],
       ),
     );
     return snapshot(sessionId);
@@ -4252,6 +4506,14 @@ class PiwibusStore {
     final activityAudience = notificationAudienceForTripOwner(
       tripId,
     ).sessionIds;
+    final ratingActivityId = tripRatingActivityId(sessionId, tripId);
+    final ratingPushEvent = createPushOutboxEvent(
+      eventId: ratingActivityId,
+      title: 'Nouvelle note',
+      body: 'Votre trajet a reçu une nouvelle évaluation.',
+      data: <String, String>{'type': 'trip_rated', 'tripId': tripId},
+      audienceSessionIds: activityAudience,
+    );
     _state['trips'] = trips;
     addActivity(
       title: 'Nouvelle note',
@@ -4259,10 +4521,18 @@ class PiwibusStore {
       iconKey: 'star',
       colorValue: 0xFFEE964B,
       audienceSessionIds: activityAudience,
-      activityId: tripRatingActivityId(sessionId, tripId),
+      activityId: ratingActivityId,
     );
     _notifySharedChange();
-    await _persist(const StateMutationBatch(trips: true, activity: true));
+    await _persist(
+      StateMutationBatch(
+        trips: true,
+        activity: true,
+        outboxEvents: <StateOutboxEvent>[
+          if (ratingPushEvent != null) ratingPushEvent,
+        ],
+      ),
+    );
     return snapshot(sessionId);
   }
 
@@ -4302,10 +4572,18 @@ class PiwibusStore {
     final likeActivityId = liked
         ? 'trip-liked:$tripId:${_newEntityId('like')}'
         : null;
+    StateOutboxEvent? likePushEvent;
     if (liked) {
       final activityAudience = notificationAudienceForTripOwner(
         tripId,
       ).sessionIds..remove(sessionId);
+      likePushEvent = createPushOutboxEvent(
+        eventId: likeActivityId!,
+        title: 'Nouveau j’aime',
+        body: 'Votre trajet a reçu un nouveau j’aime.',
+        data: <String, String>{'type': 'trip_liked', 'tripId': tripId},
+        audienceSessionIds: activityAudience,
+      );
       addActivity(
         title: 'Nouveau j\'aime',
         subtitle: 'Votre trajet a reçu un nouveau j\'aime.',
@@ -4316,7 +4594,15 @@ class PiwibusStore {
       );
     }
     _notifySharedChange();
-    await _persist(StateMutationBatch(trips: true, activity: liked));
+    await _persist(
+      StateMutationBatch(
+        trips: true,
+        activity: liked,
+        outboxEvents: <StateOutboxEvent>[
+          if (likePushEvent != null) likePushEvent,
+        ],
+      ),
+    );
     return <String, dynamic>{
       ...snapshot(sessionId),
       'tripLikeChanged': liked,
@@ -4414,6 +4700,16 @@ class PiwibusStore {
     };
     reports.insert(0, report);
     _state['reports'] = reports;
+    final lineCode = _text(report['lineCode']);
+    final reportAudience = notificationAudienceNearLine(lineCode);
+    final reportPushEvent = createPushOutboxEvent(
+      eventId: 'report-nearby:$reportId',
+      title: 'Nouveau signalement',
+      body:
+          'Une alerte vient d’être publiée sur la ligne $lineCode près de vous.',
+      data: <String, String>{'type': 'report_created', 'lineCode': lineCode},
+      audienceSessionIds: reportAudience.sessionIds,
+    );
     addActivity(
       title: 'Signalement enregistré',
       subtitle: 'Bus ${report['busNumber']} publié immédiatement.',
@@ -4424,7 +4720,14 @@ class PiwibusStore {
     );
     _notifySharedChange();
     await _persist(
-      const StateMutationBatch(reports: true, sessions: true, activity: true),
+      StateMutationBatch(
+        reports: true,
+        sessions: true,
+        activity: true,
+        outboxEvents: <StateOutboxEvent>[
+          if (reportPushEvent != null) reportPushEvent,
+        ],
+      ),
     );
     return snapshot(sessionId);
   }
@@ -7089,10 +7392,12 @@ class PiwibusStore {
     _activePersistenceWrites += 1;
     try {
       await _persistence.applyMutations(state: state ?? _state, batch: batch);
+      _notifySharedChange(committed: true);
+      _publishCommittedChange();
     } on ConcurrentStateMutationException catch (error, stackTrace) {
       await _reloadStateFromPersistence();
       _externalReloadPending = false;
-      _notifySharedChange(publishExternal: false);
+      _notifySharedChange(committed: true);
       Error.throwWithStackTrace(error, stackTrace);
     } finally {
       _activePersistenceWrites -= 1;
@@ -7101,7 +7406,7 @@ class PiwibusStore {
         if (await _persistence.hasExternalChanges()) {
           await _reloadStateFromPersistence();
         }
-        _notifySharedChange(publishExternal: false);
+        _notifySharedChange(committed: true);
       }
     }
   }
@@ -7112,16 +7417,21 @@ class PiwibusStore {
     await _persistence.close();
   }
 
-  void _notifySharedChange({bool publishExternal = true}) {
+  void _notifySharedChange({bool committed = false}) {
+    if (!committed) return;
     _sharedRevision += 1;
     if (!_sharedChanges.isClosed) {
       _sharedChanges.add(_sharedRevision);
     }
+  }
+
+  void _publishCommittedChange() {
     final publish = _publishSharedChange;
-    if (publishExternal && publish != null) {
+    if (publish != null) {
       unawaited(
         publish().catchError((_) {
-          // Redis/pubsub publication is best-effort; persistence already won.
+          // The persistence commit already succeeded; the publisher logs its
+          // own failure and the database outbox/reconciliation retries it.
         }),
       );
     }

@@ -17,8 +17,10 @@ import '../lib/src/ops_logger.dart';
 import '../lib/src/google_id_token_verifier.dart';
 import '../lib/src/password_reset_email_service.dart';
 import '../lib/src/public_health.dart';
+import '../lib/src/redis_outbox_relay.dart';
 import '../lib/src/production_config.dart';
 import '../lib/src/push_notifications.dart';
+import '../lib/src/push_outbox_worker.dart';
 import '../lib/src/rate_limiter.dart';
 import '../lib/src/redis_realtime.dart';
 import '../lib/src/state_persistence.dart';
@@ -78,15 +80,75 @@ Future<void> main(List<String> args) async {
         .toSet(),
   );
   if (redis != null) {
-    store.attachChangePublisher(redis.publishChange);
     store.listenToExternalChanges(redis.remoteChanges);
   }
   final jwtCodec = _JwtCodec.fromEnvironment();
   final metrics = _MetricsRegistry();
+  RedisOutboxRelay? redisOutboxRelay;
+  PushOutboxWorker? pushOutboxWorker;
+  Timer? externalChangeReconcileTimer;
+  Timer? presenceSyncTimer;
+  StreamSubscription<void>? presenceChangeSubscription;
+  if (redis != null && store.isDatabaseBacked) {
+    redisOutboxRelay = RedisOutboxRelay(
+      store: store,
+      redis: redis,
+      logger: logger,
+      onPublished: metrics.outboxEventPublished,
+      onFailure: metrics.outboxEventFailed,
+    )..start();
+    externalChangeReconcileTimer = Timer.periodic(const Duration(seconds: 10), (
+      _,
+    ) async {
+      try {
+        await store.refreshFromPersistence();
+      } catch (error, stackTrace) {
+        logger.error(
+          'External state reconciliation failed',
+          const {},
+          error,
+          stackTrace,
+        );
+      }
+    });
+    Future<void> syncRedisPresence() async {
+      try {
+        store.syncOnlineSessions(await redis.activePresenceSessionIds());
+      } catch (error, stackTrace) {
+        logger.error(
+          'Redis presence reconciliation failed',
+          const {},
+          error,
+          stackTrace,
+        );
+      }
+    }
+
+    unawaited(syncRedisPresence());
+    presenceSyncTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(syncRedisPresence()),
+    );
+    presenceChangeSubscription = redis.remotePresenceChanges.listen(
+      (_) => unawaited(syncRedisPresence()),
+    );
+  } else if (redis != null) {
+    store.attachChangePublisher(redis.publishChange);
+  }
   final snapshotPollCursors = _BoundedSnapshotCursorCache();
   final pushNotifications = PushNotificationService.fromEnvironment(
     logger: logger,
   );
+  if (redis != null && store.isDatabaseBacked) {
+    pushOutboxWorker = PushOutboxWorker(
+      store: store,
+      pushNotifications: pushNotifications,
+      logger: logger,
+      workerId: 'push:${redis.instanceId}',
+      onDelivered: metrics.pushEventDelivered,
+      onFailure: metrics.pushEventFailed,
+    )..start();
+  }
   final mapTileClient = http.Client();
   final rateLimiter = RateLimiter(
     limitPerMinute:
@@ -96,6 +158,7 @@ Future<void> main(List<String> args) async {
         180,
     redis: redis,
     trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS'),
+    onMemoryFallback: metrics.rateLimitMemoryFallback,
     pathLimitsPerMinute: const <String, int>{
       'auth/sign-in': 10,
       'auth/google/sign-in': 10,
@@ -115,54 +178,8 @@ Future<void> main(List<String> args) async {
     'PIWIBUS_STALE_TRIP_SWEEP_SECONDS',
     const Duration(seconds: 30),
   );
-  void sendTripCancellationNotice(JsonMap notice) {
-    final tokens = _stringList(notice['tokens']);
-    final tripId = _string(notice['tripId']);
-    final lineLabel = _string(notice['lineLabel']);
-    final reason = _string(notice['reason']);
-    final notificationType = _string(notice['notificationType']).isEmpty
-        ? 'trip_stopped_system'
-        : _string(notice['notificationType']);
-    final lastLocation = notice['lastLocation'];
-    final latText = lastLocation is Map ? _string(lastLocation['lat']) : '';
-    final lngText = lastLocation is Map ? _string(lastLocation['lng']) : '';
-    final tripPayload = latText.isNotEmpty && lngText.isNotEmpty
-        ? 'trip-ended:$tripId:$latText:$lngText'
-        : 'trip-ended:$tripId';
-    final locationText = lastLocation is Map
-        ? ' Derniere position: $latText / $lngText.'
-        : '';
-    unawaited(
-      pushNotifications.sendToTokens(
-        tokens: tokens,
-        title: 'Trajet $lineLabel interrompu',
-        body: '$reason$locationText',
-        data: <String, String>{
-          'type': notificationType,
-          if (_string(notice['eventId']).isNotEmpty)
-            'eventId': _string(notice['eventId']),
-          'tripId': tripId,
-          'lineCode': _string(notice['lineCode']),
-          'lineLabel': lineLabel,
-          'reason': reason,
-          'payload': tripPayload,
-          if (latText.isNotEmpty) 'lat': latText,
-          if (lngText.isNotEmpty) 'lng': lngText,
-        },
-      ),
-    );
-  }
-
-  void sendTripCancellationNoticesFromSnapshot(JsonMap payload) {
-    final rawNotices = payload.remove('_systemTripCancellationNotices');
-    if (rawNotices is! Iterable) return;
-    for (final notice in rawNotices) {
-      if (notice is Map<String, dynamic>) {
-        sendTripCancellationNotice(notice);
-      } else if (notice is Map) {
-        sendTripCancellationNotice(Map<String, dynamic>.from(notice));
-      }
-    }
+  void discardTripCancellationNoticesFromSnapshot(JsonMap payload) {
+    payload.remove('_systemTripCancellationNotices');
   }
 
   var staleTripExpiryInFlight = false;
@@ -170,16 +187,8 @@ Future<void> main(List<String> args) async {
     if (staleTripExpiryInFlight) return;
     staleTripExpiryInFlight = true;
     try {
-      final notices = await store.expireStaleActiveTrips(
-        timeout: staleTripTimeout,
-      );
-      for (final notice in notices) {
-        sendTripCancellationNotice(notice);
-      }
-      final offRouteNotices = await store.expireOffRouteActiveTrips();
-      for (final notice in offRouteNotices) {
-        sendTripCancellationNotice(notice);
-      }
+      await store.expireStaleActiveTrips(timeout: staleTripTimeout);
+      await store.expireOffRouteActiveTrips();
       await store.pruneRetainedHistory();
     } catch (error, stackTrace) {
       logger.error('Live trip sweep failed', const {}, error, stackTrace);
@@ -329,7 +338,7 @@ Future<void> main(List<String> args) async {
       final sessionId = await adminSessionIdFor(request);
       metrics.sseOpened();
       return Response.ok(
-        _adminEventStream(request, store, sessionId, metrics),
+        _adminEventStream(request, store, sessionId, metrics, redis, logger),
         headers: _eventStreamHeaders(),
       );
     } catch (error) {
@@ -340,8 +349,15 @@ Future<void> main(List<String> args) async {
     try {
       final sessionId = await adminSessionIdFor(request);
       final handler = webSocketHandler(
-        (WebSocketChannel channel, String? protocol) =>
-            _handleAdminWebSocket(request, channel, store, sessionId, metrics),
+        (WebSocketChannel channel, String? protocol) => _handleAdminWebSocket(
+          request,
+          channel,
+          store,
+          sessionId,
+          metrics,
+          redis,
+          logger,
+        ),
         protocols: const <String>[_webSocketProtocolName],
         allowedOrigins: _webSocketAllowedOrigins(corsOrigin),
       );
@@ -365,23 +381,7 @@ Future<void> main(List<String> args) async {
       final reason = bodyReason.isEmpty
           ? 'Trajet arrete par un administrateur Piwibus.'
           : bodyReason;
-      final audience = store.notificationAudienceForTrip(id);
       await store.stopTrip(sessionId, id, reason: reason);
-      if (audience.tokens.isNotEmpty) {
-        unawaited(
-          pushNotifications.sendToTokens(
-            tokens: audience.tokens,
-            title: 'Trajet live arrete',
-            body: reason,
-            data: <String, String>{
-              'type': 'trip_stopped_admin',
-              'eventId': 'trip-stopped:$id',
-              'tripId': id,
-              'reason': reason,
-            },
-          ),
-        );
-      }
       return _json(adminDashboardFor(sessionId));
     } catch (error) {
       return _errorForException(error);
@@ -453,25 +453,20 @@ Future<void> main(List<String> args) async {
         lineCode: _boundedString(body['lineCode'], 32, fieldName: 'Ligne'),
         radiusMeters: double.tryParse(_string(body['radiusMeters'])) ?? 2000,
       );
+      final eventId = store.newPushEventId();
       await store.recordAdminNotification(
         sessionId: sessionId,
         title: title,
         body: message,
         targetLabel: '$targetType ${targetId.isEmpty ? "global" : targetId}',
+        eventId: eventId,
+        data: <String, String>{
+          'type': 'admin_broadcast',
+          'targetType': targetType,
+          if (targetId.isNotEmpty) 'targetId': targetId,
+        },
         audienceSessionIds: audience.sessionIds,
       );
-      if (audience.tokens.isNotEmpty) {
-        await pushNotifications.sendToTokens(
-          tokens: audience.tokens,
-          title: title,
-          body: message,
-          data: <String, String>{
-            'type': 'admin_broadcast',
-            'targetType': targetType,
-            if (targetId.isNotEmpty) 'targetId': targetId,
-          },
-        );
-      }
       return _json(<String, dynamic>{
         ...adminDashboardFor(sessionId),
         'notificationResult': <String, dynamic>{
@@ -531,7 +526,15 @@ Future<void> main(List<String> args) async {
     final sessionId = await sessionIdFor(request);
     metrics.sseOpened();
     return Response.ok(
-      _snapshotEventStream(request, store, sessionId, jwtCodec, metrics),
+      _snapshotEventStream(
+        request,
+        store,
+        sessionId,
+        jwtCodec,
+        metrics,
+        redis,
+        logger,
+      ),
       headers: _eventStreamHeaders(),
     );
   });
@@ -545,6 +548,8 @@ Future<void> main(List<String> args) async {
         sessionId,
         jwtCodec,
         metrics,
+        redis,
+        logger,
       ),
       protocols: const <String>[_webSocketProtocolName],
       allowedOrigins: _webSocketAllowedOrigins(corsOrigin),
@@ -749,7 +754,7 @@ Future<void> main(List<String> args) async {
     final sessionId = await sessionIdFor(request);
     return _handleJson(request, jwtCodec, (_) async {
       final snapshot = await store.logout(sessionId);
-      sendTripCancellationNoticesFromSnapshot(snapshot);
+      discardTripCancellationNoticesFromSnapshot(snapshot);
       return snapshot;
     });
   });
@@ -1066,38 +1071,6 @@ Future<void> main(List<String> args) async {
       final message = result['message'] is Map
           ? Map<String, dynamic>.from(result['message'] as Map)
           : store.lastMessageForConversation(id);
-      try {
-        final recipientIds = _stringList(result['recipientUserIds']);
-        for (final recipientId in recipientIds) {
-          if (recipientId.isEmpty) continue;
-          final audience = store.notificationAudienceForUser(recipientId);
-          if (audience.tokens.isNotEmpty) {
-            final data = <String, String>{
-              'type': 'message_created',
-              if (_string(message?['id']).isNotEmpty)
-                'eventId': 'message:$id:${_string(message?['id'])}',
-              'conversationId': id,
-              'messageId': _string(message?['id']),
-              'senderId': _string(
-                message?['senderId'] ?? message?['sender_id'],
-              ),
-              'createdAt': _string(
-                message?['createdAt'] ?? message?['created_at'],
-              ),
-            };
-            unawaited(
-              pushNotifications.sendToTokens(
-                tokens: audience.tokens,
-                title: 'Nouveau message',
-                body: 'Vous avez reçu un nouveau message',
-                data: data,
-              ),
-            );
-          }
-        }
-      } catch (_) {
-        // Push failures are non-fatal for message delivery.
-      }
       if (compact) {
         return _json(<String, dynamic>{
           'ok': true,
@@ -1190,7 +1163,7 @@ Future<void> main(List<String> args) async {
     final sessionId = await sessionIdFor(request);
     return _handleJson(request, jwtCodec, (body) async {
       final snapshot = await store.startTrip(sessionId, body);
-      sendTripCancellationNoticesFromSnapshot(snapshot);
+      discardTripCancellationNoticesFromSnapshot(snapshot);
       final lineCode = _string(body['lineCode']);
       final tripId = _string(body['tripId']).trim();
       final activityId = tripId.isEmpty ? null : 'trip-started-nearby:$tripId';
@@ -1205,19 +1178,6 @@ Future<void> main(List<String> args) async {
           audienceSessionIds: audience.sessionIds,
         );
       }
-      unawaited(
-        pushNotifications.sendToTokens(
-          tokens: audience.tokens,
-          title: 'Nouveau bus sur la ligne',
-          body: 'Un nouveau bus vient d’apparaître sur la ligne $lineCode.',
-          data: <String, String>{
-            'type': 'trip_started',
-            'lineCode': lineCode,
-            if (tripId.isNotEmpty) 'tripId': tripId,
-            if (activityId != null) 'eventId': activityId,
-          },
-        ),
-      );
       return snapshot;
     });
   });
@@ -1233,7 +1193,6 @@ Future<void> main(List<String> args) async {
           includeSnapshot: !compact,
         );
       } on SystemTripCancellationException catch (error) {
-        sendTripCancellationNotice(error.notice);
         throw StateError(error.message);
       }
     });
@@ -1283,19 +1242,6 @@ Future<void> main(List<String> args) async {
         );
       }
       final result = await store.rateTrip(sessionId, id, score);
-      final audience = store.notificationAudienceForTripOwner(id);
-      unawaited(
-        pushNotifications.sendToTokens(
-          tokens: audience.tokens,
-          title: 'Nouvelle note',
-          body: 'Votre trajet a reçu une nouvelle évaluation.',
-          data: <String, String>{
-            'type': 'trip_rated',
-            'eventId': store.tripRatingActivityId(sessionId, id),
-            'tripId': id,
-          },
-        ),
-      );
       return result;
     });
   });
@@ -1307,22 +1253,6 @@ Future<void> main(List<String> args) async {
         throw const FormatException('Etat du like requis.');
       }
       final result = await store.setTripLike(sessionId, id, liked);
-      if (result['tripLikeChanged'] == true && liked) {
-        final likeActivityId = _string(result['tripLikeActivityId']);
-        final audience = store.notificationAudienceForTripOwner(id);
-        unawaited(
-          pushNotifications.sendToTokens(
-            tokens: audience.tokens,
-            title: 'Nouveau j\'aime',
-            body: 'Votre trajet a reçu un nouveau j\'aime.',
-            data: <String, String>{
-              'type': 'trip_liked',
-              'eventId': likeActivityId,
-              'tripId': id,
-            },
-          ),
-        );
-      }
       result.remove('tripLikeChanged');
       result.remove('tripLikeActivityId');
       return result;
@@ -1350,19 +1280,6 @@ Future<void> main(List<String> args) async {
           audienceSessionIds: audience.sessionIds,
         );
       }
-      unawaited(
-        pushNotifications.sendToTokens(
-          tokens: audience.tokens,
-          title: 'Nouveau signalement',
-          body:
-              'Une alerte vient d’être publiée sur la ligne $lineCode près de vous.',
-          data: <String, String>{
-            'type': 'report_created',
-            'lineCode': lineCode,
-            if (eventId != null) 'eventId': eventId,
-          },
-        ),
-      );
       return snapshot;
     });
   });
@@ -1429,6 +1346,11 @@ Future<void> main(List<String> args) async {
       'reason': reason,
     });
     staleTripExpiryTimer.cancel();
+    externalChangeReconcileTimer?.cancel();
+    presenceSyncTimer?.cancel();
+    await presenceChangeSubscription?.cancel();
+    await pushOutboxWorker?.close();
+    await redisOutboxRelay?.close();
     await server.close(force: false);
     pushNotifications.close();
     mapTileClient.close();
@@ -2154,17 +2076,87 @@ double _distanceMeters(
   return earthRadiusMeters * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h));
 }
 
+Future<String?> _registerSessionPresence({
+  required PiwibusStore store,
+  required RedisRealtime? redis,
+  required OpsLogger logger,
+  required String sessionId,
+}) async {
+  store.setSessionOnline(sessionId);
+  if (redis == null || !store.isDatabaseBacked) return null;
+  try {
+    final connectionId = await redis.registerPresence(sessionId: sessionId);
+    store.syncOnlineSessions(await redis.activePresenceSessionIds());
+    return connectionId;
+  } catch (error, stackTrace) {
+    logger.error(
+      'Distributed session presence registration failed',
+      const {},
+      error,
+      stackTrace,
+    );
+    return null;
+  }
+}
+
+Future<void> _renewSessionPresence({
+  required RedisRealtime? redis,
+  required OpsLogger logger,
+  required String sessionId,
+  required String? connectionId,
+}) async {
+  if (redis == null || connectionId == null) return;
+  try {
+    await redis.renewPresence(sessionId: sessionId, connectionId: connectionId);
+  } catch (error, stackTrace) {
+    logger.error(
+      'Distributed session presence renewal failed',
+      const {},
+      error,
+      stackTrace,
+    );
+  }
+}
+
+Future<void> _unregisterSessionPresence({
+  required PiwibusStore store,
+  required RedisRealtime? redis,
+  required OpsLogger logger,
+  required String sessionId,
+  required String? connectionId,
+}) async {
+  store.setSessionOffline(sessionId);
+  if (redis == null || connectionId == null || !store.isDatabaseBacked) return;
+  try {
+    await redis.unregisterPresence(
+      sessionId: sessionId,
+      connectionId: connectionId,
+    );
+    store.syncOnlineSessions(await redis.activePresenceSessionIds());
+  } catch (error, stackTrace) {
+    logger.error(
+      'Distributed session presence removal failed',
+      const {},
+      error,
+      stackTrace,
+    );
+  }
+}
+
 Stream<List<int>> _snapshotEventStream(
   Request request,
   PiwibusStore store,
   String sessionId,
   _JwtCodec jwtCodec,
   _MetricsRegistry metrics,
+  RedisRealtime? redis,
+  OpsLogger logger,
 ) {
   late final StreamController<List<int>> controller;
   StreamSubscription<int>? subscription;
   Timer? keepAliveTimer;
   Timer? snapshotDebounceTimer;
+  Future<String?>? presenceRegistration;
   _RealtimeSnapshotCursor? lastSnapshot;
   final clientSnapshotRevision = _clientSnapshotRevision(request);
 
@@ -2218,21 +2210,45 @@ Stream<List<int>> _snapshotEventStream(
 
   controller = StreamController<List<int>>(
     onListen: () {
-      store.setSessionOnline(sessionId);
+      presenceRegistration = _registerSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+      );
       addText('retry: 3000\n\n');
       sendSnapshot();
       subscription = store.sharedChanges.listen((_) => scheduleSnapshot());
-      keepAliveTimer = Timer.periodic(
-        _realtimeKeepAliveInterval,
-        (_) => addText(': ping ${DateTime.now().toIso8601String()}\n\n'),
-      );
+      keepAliveTimer = Timer.periodic(_realtimeKeepAliveInterval, (_) {
+        addText(': ping ${DateTime.now().toIso8601String()}\n\n');
+        final registration = presenceRegistration;
+        if (registration != null) {
+          unawaited(
+            registration.then(
+              (connectionId) => _renewSessionPresence(
+                redis: redis,
+                logger: logger,
+                sessionId: sessionId,
+                connectionId: connectionId,
+              ),
+            ),
+          );
+        }
+      });
     },
     onCancel: () async {
-      store.setSessionOffline(sessionId);
       keepAliveTimer?.cancel();
       snapshotDebounceTimer?.cancel();
       metrics.sseClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
   );
 
@@ -2244,11 +2260,14 @@ Stream<List<int>> _adminEventStream(
   PiwibusStore store,
   String sessionId,
   _MetricsRegistry metrics,
+  RedisRealtime? redis,
+  OpsLogger logger,
 ) {
   late final StreamController<List<int>> controller;
   StreamSubscription<int>? subscription;
   Timer? keepAliveTimer;
   Timer? snapshotDebounceTimer;
+  Future<String?>? presenceRegistration;
 
   void addText(String text) {
     if (!controller.isClosed) {
@@ -2275,19 +2294,45 @@ Stream<List<int>> _adminEventStream(
 
   controller = StreamController<List<int>>(
     onListen: () {
+      presenceRegistration = _registerSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+      );
       addText('retry: 3000\n\n');
       sendDashboard();
       subscription = store.sharedChanges.listen((_) => scheduleDashboard());
-      keepAliveTimer = Timer.periodic(
-        const Duration(seconds: 25),
-        (_) => addText(': ping ${DateTime.now().toIso8601String()}\n\n'),
-      );
+      keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+        addText(': ping ${DateTime.now().toIso8601String()}\n\n');
+        final registration = presenceRegistration;
+        if (registration != null) {
+          unawaited(
+            registration.then(
+              (connectionId) => _renewSessionPresence(
+                redis: redis,
+                logger: logger,
+                sessionId: sessionId,
+                connectionId: connectionId,
+              ),
+            ),
+          );
+        }
+      });
     },
     onCancel: () async {
       keepAliveTimer?.cancel();
       snapshotDebounceTimer?.cancel();
       metrics.sseClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
   );
 
@@ -2301,6 +2346,8 @@ void _handleSnapshotWebSocket(
   String sessionId,
   _JwtCodec jwtCodec,
   _MetricsRegistry metrics,
+  RedisRealtime? redis,
+  OpsLogger logger,
 ) {
   StreamSubscription<int>? subscription;
   Timer? keepAliveTimer;
@@ -2308,8 +2355,14 @@ void _handleSnapshotWebSocket(
   _RealtimeSnapshotCursor? lastSnapshot;
   final clientSnapshotRevision = _clientSnapshotRevision(request);
   var closed = false;
+  Future<String?>? presenceRegistration;
   metrics.webSocketOpened();
-  store.setSessionOnline(sessionId);
+  presenceRegistration = _registerSessionPresence(
+    store: store,
+    redis: redis,
+    logger: logger,
+    sessionId: sessionId,
+  );
 
   void send(Object payload) {
     if (closed) return;
@@ -2357,30 +2410,56 @@ void _handleSnapshotWebSocket(
 
   sendSnapshot();
   subscription = store.sharedChanges.listen((_) => scheduleSnapshot());
-  keepAliveTimer = Timer.periodic(
-    _realtimeKeepAliveInterval,
-    (_) => send(<String, dynamic>{
+  keepAliveTimer = Timer.periodic(_realtimeKeepAliveInterval, (_) {
+    send(<String, dynamic>{
       'type': 'ping',
       'timestamp': DateTime.now().toIso8601String(),
-    }),
-  );
+    });
+    final registration = presenceRegistration;
+    if (registration != null) {
+      unawaited(
+        registration.then(
+          (connectionId) => _renewSessionPresence(
+            redis: redis,
+            logger: logger,
+            sessionId: sessionId,
+            connectionId: connectionId,
+          ),
+        ),
+      );
+    }
+  });
   channel.stream.listen(
     (_) {},
     onDone: () async {
       closed = true;
-      store.setSessionOffline(sessionId);
       keepAliveTimer?.cancel();
       snapshotDebounceTimer?.cancel();
       metrics.webSocketClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
     onError: (_) async {
       closed = true;
-      store.setSessionOffline(sessionId);
       keepAliveTimer?.cancel();
       snapshotDebounceTimer?.cancel();
       metrics.webSocketClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
     cancelOnError: true,
   );
@@ -2392,12 +2471,21 @@ void _handleAdminWebSocket(
   PiwibusStore store,
   String sessionId,
   _MetricsRegistry metrics,
+  RedisRealtime? redis,
+  OpsLogger logger,
 ) {
   StreamSubscription<int>? subscription;
   Timer? keepAliveTimer;
   Timer? snapshotDebounceTimer;
   var closed = false;
+  Future<String?>? presenceRegistration;
   metrics.webSocketOpened();
+  presenceRegistration = _registerSessionPresence(
+    store: store,
+    redis: redis,
+    logger: logger,
+    sessionId: sessionId,
+  );
 
   void send(Object payload) {
     if (closed) return;
@@ -2421,13 +2509,25 @@ void _handleAdminWebSocket(
 
   sendDashboard();
   subscription = store.sharedChanges.listen((_) => scheduleDashboard());
-  keepAliveTimer = Timer.periodic(
-    const Duration(seconds: 25),
-    (_) => send(<String, dynamic>{
+  keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+    send(<String, dynamic>{
       'type': 'ping',
       'timestamp': DateTime.now().toIso8601String(),
-    }),
-  );
+    });
+    final registration = presenceRegistration;
+    if (registration != null) {
+      unawaited(
+        registration.then(
+          (connectionId) => _renewSessionPresence(
+            redis: redis,
+            logger: logger,
+            sessionId: sessionId,
+            connectionId: connectionId,
+          ),
+        ),
+      );
+    }
+  });
   channel.stream.listen(
     (_) {},
     onDone: () async {
@@ -2436,6 +2536,14 @@ void _handleAdminWebSocket(
       snapshotDebounceTimer?.cancel();
       metrics.webSocketClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
     onError: (_) async {
       closed = true;
@@ -2443,6 +2551,14 @@ void _handleAdminWebSocket(
       snapshotDebounceTimer?.cancel();
       metrics.webSocketClosed();
       await subscription?.cancel();
+      final connectionId = await presenceRegistration;
+      await _unregisterSessionPresence(
+        store: store,
+        redis: redis,
+        logger: logger,
+        sessionId: sessionId,
+        connectionId: connectionId,
+      );
     },
     cancelOnError: true,
   );
@@ -2701,15 +2817,6 @@ Duration _durationFromEnvSeconds(String name, Duration fallback) {
   return Duration(seconds: seconds);
 }
 
-List<String> _stringList(Object? value) {
-  if (value is! Iterable) return const <String>[];
-  return value
-      .map((item) => _string(item))
-      .where((item) => item.isNotEmpty)
-      .toSet()
-      .toList(growable: false);
-}
-
 List<JsonMap> _mapList(Object? value) {
   if (value is! Iterable) return const <JsonMap>[];
   return value
@@ -2911,6 +3018,11 @@ class _MetricsRegistry {
   int _responses5xx = 0;
   int _webSocketConnections = 0;
   int _sseConnections = 0;
+  int _outboxEventsPublished = 0;
+  int _outboxEventsFailed = 0;
+  int _rateLimitMemoryFallbacks = 0;
+  int _pushEventsDelivered = 0;
+  int _pushEventsFailed = 0;
   double _latencyTotalMs = 0;
   double _latencyMaxMs = 0;
 
@@ -2950,6 +3062,26 @@ class _MetricsRegistry {
     if (_sseConnections > 0) _sseConnections -= 1;
   }
 
+  void outboxEventPublished() {
+    _outboxEventsPublished += 1;
+  }
+
+  void outboxEventFailed() {
+    _outboxEventsFailed += 1;
+  }
+
+  void rateLimitMemoryFallback() {
+    _rateLimitMemoryFallbacks += 1;
+  }
+
+  void pushEventDelivered() {
+    _pushEventsDelivered += 1;
+  }
+
+  void pushEventFailed() {
+    _pushEventsFailed += 1;
+  }
+
   JsonMap snapshot() {
     final average = _responsesTotal == 0
         ? 0
@@ -2963,6 +3095,11 @@ class _MetricsRegistry {
       'latencyMaxMs': _latencyMaxMs,
       'webSocketConnections': _webSocketConnections,
       'sseConnections': _sseConnections,
+      'outboxEventsPublished': _outboxEventsPublished,
+      'outboxEventsFailed': _outboxEventsFailed,
+      'rateLimitMemoryFallbacks': _rateLimitMemoryFallbacks,
+      'pushEventsDelivered': _pushEventsDelivered,
+      'pushEventsFailed': _pushEventsFailed,
     };
   }
 
@@ -2993,6 +3130,21 @@ piwibus_websocket_connections ${current['webSocketConnections']}
 # HELP piwibus_sse_connections Current SSE connections.
 # TYPE piwibus_sse_connections gauge
 piwibus_sse_connections ${current['sseConnections']}
+# HELP piwibus_outbox_events_published_total Outbox events published to Redis.
+# TYPE piwibus_outbox_events_published_total counter
+piwibus_outbox_events_published_total ${current['outboxEventsPublished']}
+# HELP piwibus_outbox_events_failed_total Outbox event publication failures.
+# TYPE piwibus_outbox_events_failed_total counter
+piwibus_outbox_events_failed_total ${current['outboxEventsFailed']}
+# HELP piwibus_rate_limit_memory_fallbacks_total Rate limit checks handled by local memory fallback.
+# TYPE piwibus_rate_limit_memory_fallbacks_total counter
+piwibus_rate_limit_memory_fallbacks_total ${current['rateLimitMemoryFallbacks']}
+# HELP piwibus_push_outbox_delivered_total Push outbox events delivered.
+# TYPE piwibus_push_outbox_delivered_total counter
+piwibus_push_outbox_delivered_total ${current['pushEventsDelivered']}
+# HELP piwibus_push_outbox_failed_total Push outbox delivery attempts that failed.
+# TYPE piwibus_push_outbox_failed_total counter
+piwibus_push_outbox_failed_total ${current['pushEventsFailed']}
 ''';
   }
 
