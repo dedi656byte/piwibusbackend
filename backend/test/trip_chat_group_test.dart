@@ -10,7 +10,9 @@ import 'package:test/test.dart';
 void main() {
   group('trip chat conversations', () {
     test('notifies the trip owner when a new like is added', () async {
-      final store = await _openTempStore('piwibus-trip-like');
+      final (store, persistence) = await _openCapturingTempStore(
+        'piwibus-trip-like',
+      );
       final line = store.lines().first;
       final lineCode = _string(line['code']);
 
@@ -44,12 +46,17 @@ void main() {
       );
       expect(result['tripLikeChanged'], isTrue);
       final ownerActivity = store.snapshot('owner-session')['activity'] as List;
-      expect(
-        ownerActivity.any(
-          (item) => item is Map && item['title'] == "Nouveau j'aime",
-        ),
-        isTrue,
+      final likeActivity = ownerActivity.cast<Map>().firstWhere(
+        (item) => item['title'] == "Nouveau j'aime",
       );
+      expect(likeActivity['subtitle'], contains(lineCode));
+      final likePush = persistence.outboxEvents
+          .map((event) => event.payload)
+          .firstWhere(
+            (payload) => (payload['data'] as Map)['type'] == 'trip_liked',
+          );
+      expect(likePush['body'], contains(lineCode));
+      expect((likePush['data'] as Map)['lineCode'], lineCode);
       final likerActivity = store.snapshot('liker-session')['activity'] as List;
       final observerActivity =
           store.snapshot('observer-session')['activity'] as List;
@@ -80,7 +87,9 @@ void main() {
     });
 
     test('notifies only the trip owner when a new rating is added', () async {
-      final store = await _openTempStore('piwibus-trip-rating');
+      final (store, persistence) = await _openCapturingTempStore(
+        'piwibus-trip-rating',
+      );
       final line = store.lines().first;
       final lineCode = _string(line['code']);
 
@@ -130,6 +139,17 @@ void main() {
 
       final ownerActivity =
           store.snapshot('rating-owner-session')['activity'] as List;
+      final ratingActivity = ownerActivity.cast<Map>().firstWhere(
+        (item) => item['title'] == 'Nouvelle note',
+      );
+      expect(ratingActivity['subtitle'], contains(lineCode));
+      final ratingPush = persistence.outboxEvents
+          .map((event) => event.payload)
+          .firstWhere(
+            (payload) => (payload['data'] as Map)['type'] == 'trip_rated',
+          );
+      expect(ratingPush['body'], contains(lineCode));
+      expect((ratingPush['data'] as Map)['lineCode'], lineCode);
       final authorActivity =
           store.snapshot('rating-author-session')['activity'] as List;
       final observerActivity =
@@ -157,7 +177,9 @@ void main() {
     test(
       'creates a shared trip conversation and exposes it to participants',
       () async {
-        final store = await _openTempStore('piwibus-trip-chat');
+        final (store, persistence) = await _openCapturingTempStore(
+          'piwibus-trip-chat',
+        );
 
         final line = store.lines().first;
         final lineCode = _string(line['code']);
@@ -225,6 +247,14 @@ void main() {
         expect(sent['conversation']['kind'], 'trip');
         expect(sent['conversation']['tripId'], tripId);
         final conversationId = _string(observerTripConversation['id']);
+        final messagePush = persistence.outboxEvents
+            .map((event) => event.payload)
+            .firstWhere(
+              (payload) =>
+                  (payload['data'] as Map)['conversationId'] == conversationId,
+            );
+        expect(messagePush['title'], contains(lineCode));
+        expect((messagePush['data'] as Map)['lineCode'], lineCode);
         final sentMessage = sent['message'] as Map<String, dynamic>;
         final sequence = sentMessage['sequence'];
         final retried = await store.sendMessageItem(
@@ -852,6 +882,38 @@ Future<PiwibusStore> _openTempStore(String prefix) async {
 
   final stateFile = File(p.join(tempDir.path, 'state.json'));
   return PiwibusStore.openWithPersistence(JsonFileStatePersistence(stateFile));
+}
+
+Future<(PiwibusStore, _CapturingStatePersistence)> _openCapturingTempStore(
+  String prefix,
+) async {
+  final tempDir = await Directory.systemTemp.createTemp(prefix);
+  final persistence = _CapturingStatePersistence(
+    File(p.join(tempDir.path, 'state.json')),
+  );
+  final store = await PiwibusStore.openWithPersistence(persistence);
+  addTearDown(() async {
+    await store.close();
+    if (tempDir.existsSync()) {
+      await tempDir.delete(recursive: true);
+    }
+  });
+  return (store, persistence);
+}
+
+class _CapturingStatePersistence extends JsonFileStatePersistence {
+  _CapturingStatePersistence(super.stateFile);
+
+  final List<StateOutboxEvent> outboxEvents = <StateOutboxEvent>[];
+
+  @override
+  Future<void> applyMutations({
+    required Map<String, dynamic> state,
+    required StateMutationBatch batch,
+  }) async {
+    outboxEvents.addAll(batch.outboxEvents);
+    await super.applyMutations(state: state, batch: batch);
+  }
 }
 
 Map<String, dynamic> _routePointLocation(JsonMap line) {

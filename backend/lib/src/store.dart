@@ -2507,6 +2507,19 @@ class PiwibusStore {
     );
     if (index < 0) throw StateError('Conversation introuvable.');
     final conversation = conversations[index];
+    final conversationTripId = _text(conversation['tripId']);
+    final conversationTrip = _text(conversation['kind']) == 'trip'
+        ? _trips().firstWhere(
+            (trip) => _text(trip['id']) == conversationTripId,
+            orElse: () => <String, dynamic>{},
+          )
+        : <String, dynamic>{};
+    final conversationLineCode = _text(
+      conversationTrip['line_code'] ?? conversationTrip['lineCode'],
+    );
+    final conversationLineLabel = conversationLineCode.isEmpty
+        ? ''
+        : _displayCode(conversationLineCode);
     final participantIds = _stringList(conversation['participantIds']);
     if (!participantIds.contains(currentUserId)) {
       throw StateError('Acces refuse pour cette conversation.');
@@ -2637,7 +2650,9 @@ class PiwibusStore {
         .toList(growable: false);
     final messagePushEvent = createPushOutboxEvent(
       eventId: 'message:$conversationId:$effectiveMessageId',
-      title: 'Nouveau message',
+      title: conversationLineLabel.isEmpty
+          ? 'Nouveau message'
+          : 'Nouveau message — ligne $conversationLineLabel',
       body: 'Vous avez reçu un nouveau message',
       data: <String, String>{
         'type': 'message_created',
@@ -2645,6 +2660,7 @@ class PiwibusStore {
         'messageId': effectiveMessageId,
         'senderId': currentUserId,
         'createdAt': createdAt,
+        if (conversationLineCode.isNotEmpty) 'lineCode': conversationLineCode,
       },
       audienceUserIds: recipientUserIds,
     );
@@ -4466,9 +4482,13 @@ class PiwibusStore {
       'content': text,
     }, responseKind: _TripNetworkResponseKind.snapshot);
     _state['trips'] = trips;
+    final lineCode = _text(trip['line_code'] ?? trip['lineCode']);
+    final lineDescription = lineCode.isEmpty
+        ? ''
+        : ' de la ligne ${_displayCode(lineCode)}';
     addActivity(
       title: 'Message publié',
-      subtitle: 'Chat du trajet mis à  jour.',
+      subtitle: 'Chat du trajet$lineDescription mis à  jour.',
       iconKey: 'chat',
       colorValue: 0xFF0F766E,
       audienceSessionIds: activityAudience,
@@ -4507,17 +4527,27 @@ class PiwibusStore {
       tripId,
     ).sessionIds;
     final ratingActivityId = tripRatingActivityId(sessionId, tripId);
+    final lineCode = _text(trip['line_code'] ?? trip['lineCode']);
+    final lineDescription = lineCode.isEmpty
+        ? ''
+        : ' sur la ligne ${_displayCode(lineCode)}';
+    final ratingSubtitle =
+        'Votre trajet$lineDescription a reçu une nouvelle évaluation.';
     final ratingPushEvent = createPushOutboxEvent(
       eventId: ratingActivityId,
       title: 'Nouvelle note',
-      body: 'Votre trajet a reçu une nouvelle évaluation.',
-      data: <String, String>{'type': 'trip_rated', 'tripId': tripId},
+      body: ratingSubtitle,
+      data: <String, String>{
+        'type': 'trip_rated',
+        'tripId': tripId,
+        if (lineCode.isNotEmpty) 'lineCode': lineCode,
+      },
       audienceSessionIds: activityAudience,
     );
     _state['trips'] = trips;
     addActivity(
       title: 'Nouvelle note',
-      subtitle: 'Votre trajet a reçu une nouvelle évaluation.',
+      subtitle: ratingSubtitle,
       iconKey: 'star',
       colorValue: 0xFFEE964B,
       audienceSessionIds: activityAudience,
@@ -4577,16 +4607,26 @@ class PiwibusStore {
       final activityAudience = notificationAudienceForTripOwner(
         tripId,
       ).sessionIds..remove(sessionId);
+      final lineCode = _text(trip['line_code'] ?? trip['lineCode']);
+      final lineDescription = lineCode.isEmpty
+          ? ''
+          : ' sur la ligne ${_displayCode(lineCode)}';
+      final likeSubtitle =
+          'Votre trajet$lineDescription a reçu un nouveau j’aime.';
       likePushEvent = createPushOutboxEvent(
         eventId: likeActivityId!,
         title: 'Nouveau j’aime',
-        body: 'Votre trajet a reçu un nouveau j’aime.',
-        data: <String, String>{'type': 'trip_liked', 'tripId': tripId},
+        body: likeSubtitle,
+        data: <String, String>{
+          'type': 'trip_liked',
+          'tripId': tripId,
+          if (lineCode.isNotEmpty) 'lineCode': lineCode,
+        },
         audienceSessionIds: activityAudience,
       );
       addActivity(
         title: 'Nouveau j\'aime',
-        subtitle: 'Votre trajet a reçu un nouveau j\'aime.',
+        subtitle: likeSubtitle,
         iconKey: 'heart',
         colorValue: 0xFFD1495B,
         audienceSessionIds: activityAudience,
@@ -4673,17 +4713,15 @@ class PiwibusStore {
     );
     final report = <String, dynamic>{
       'id': reportId,
-      'busNumber': busNumber.isEmpty
-          ? _normalizeCode(_text(session['selectedLineCode']))
-          : busNumber,
+      'busNumber': busNumber,
       'lineCode': _normalizeCode(
-        _text(body['lineCode']).isEmpty
-            ? _text(session['selectedLineCode'])
-            : _boundedText(
+        body.containsKey('lineCode')
+            ? _boundedText(
                 body['lineCode'],
                 _maxLineCodeLength,
                 fieldName: 'Ligne',
-              ),
+              )
+            : _text(session['selectedLineCode']),
       ),
       'lineLabel': lineLabel.isEmpty ? 'Ligne inconnue' : lineLabel,
       'reporterId': _text(owner?['id']),
@@ -4701,18 +4739,27 @@ class PiwibusStore {
     reports.insert(0, report);
     _state['reports'] = reports;
     final lineCode = _text(report['lineCode']);
+    final reportLineDescription = lineCode.isEmpty
+        ? ''
+        : ' sur la ligne ${_displayCode(lineCode)}';
+    final reportBusDescription = _text(report['busNumber']).isEmpty
+        ? 'Un signalement'
+        : 'Bus ${_text(report['busNumber'])} signalé';
+    final reportActivityDescription = _text(report['busNumber']).isEmpty
+        ? 'Signalement'
+        : 'Bus ${_text(report['busNumber'])}';
     final reportAudience = notificationAudienceNearLine(lineCode);
     final reportPushEvent = createPushOutboxEvent(
       eventId: 'report-nearby:$reportId',
       title: 'Nouveau signalement',
-      body:
-          'Une alerte vient d’être publiée sur la ligne $lineCode près de vous.',
+      body: '$reportBusDescription$reportLineDescription près de vous.',
       data: <String, String>{'type': 'report_created', 'lineCode': lineCode},
       audienceSessionIds: reportAudience.sessionIds,
     );
     addActivity(
       title: 'Signalement enregistré',
-      subtitle: 'Bus ${report['busNumber']} publié immédiatement.',
+      subtitle:
+          '$reportActivityDescription$reportLineDescription publié immédiatement.',
       iconKey: 'report',
       colorValue: 0xFF0F766E,
       audienceSessionIds: <String>[sessionId],
@@ -6180,14 +6227,15 @@ class PiwibusStore {
     final locationMap = location is Map<String, dynamic>
         ? location
         : const <String, dynamic>{};
+    final lineCode = input.containsKey('lineCode')
+        ? input['lineCode']
+        : input.containsKey('line_code')
+        ? input['line_code']
+        : input['busNumber'];
     return <String, dynamic>{
       'id': _text(input['id']),
       'busNumber': _text(input['busNumber']),
-      'lineCode': _normalizeCode(
-        _text(input['lineCode']).isEmpty
-            ? _text(input['busNumber'])
-            : _text(input['lineCode']),
-      ),
+      'lineCode': _normalizeCode(_text(lineCode)),
       'lineLabel': _text(input['lineLabel']),
       'reporterId': _text(input['reporterId'] ?? input['reporter_id']),
       'reporterName': _text(input['reporterName']),

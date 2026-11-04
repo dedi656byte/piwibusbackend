@@ -11,7 +11,7 @@ void main() {
     final tempDir = await Directory.systemTemp.createTemp(
       'piwibus-activity-idempotency',
     );
-    final persistence = JsonFileStatePersistence(
+    final persistence = _CapturingStatePersistence(
       File(p.join(tempDir.path, 'state.json')),
     );
     final store = await PiwibusStore.openWithPersistence(persistence);
@@ -25,6 +25,11 @@ void main() {
     await store.register('activity-session', <String, dynamic>{
       'fullName': 'Activity Owner',
       'email': 'activity-owner@example.com',
+      'password': 'password123',
+    });
+    await store.register('nearby-session', <String, dynamic>{
+      'fullName': 'Nearby User',
+      'email': 'nearby-user@example.com',
       'password': 'password123',
     });
     await store.publishActivity(
@@ -56,10 +61,27 @@ void main() {
     );
 
     expect(_activityCount(store, 'activity-session'), 2);
+    final reportLine = store.lines().firstWhere(
+      (line) => _text(line['code']) == '12',
+    );
+    await store.startTrip('activity-session', <String, dynamic>{
+      'tripId': 'report-nearby-trip',
+      'lineCode': '12',
+      'liveLocation': _routePointLocation(reportLine),
+    });
+    await store.startTrip('nearby-session', <String, dynamic>{
+      'tripId': 'nearby-report-audience-trip',
+      'lineCode': '12',
+      'liveLocation': _routePointLocation(reportLine),
+    });
+    expect(
+      store.notificationAudienceNearLine('12').sessionIds,
+      contains('nearby-session'),
+    );
 
     final report = <String, dynamic>{
       'reportId': 'report-123',
-      'busNumber': '12',
+      'busNumber': '777',
       'lineCode': '12',
       'location': <String, double>{'lat': 5.34, 'lng': -4.01},
       'note': 'Accident',
@@ -82,6 +104,45 @@ void main() {
           .length,
       1,
     );
+    final reportActivity = (snapshot['activity'] as List)
+        .whereType<Map>()
+        .firstWhere((entry) => entry['title'] == 'Signalement enregistré');
+    expect(reportActivity['subtitle'], contains('Bus 777'));
+    expect(reportActivity['subtitle'], contains('ligne 12'));
+    final reportPush = persistence.outboxEvents
+        .map((event) => event.payload)
+        .firstWhere(
+          (payload) => (payload['data'] as Map)['type'] == 'report_created',
+        );
+    expect(reportPush['body'], contains('Bus 777'));
+    expect(reportPush['body'], contains('ligne 12'));
+
+    await store.createReport('activity-session', <String, dynamic>{
+      'reportId': 'report-without-line',
+      'busNumber': '812',
+      'lineCode': '',
+      'location': <String, double>{'lat': 5.34, 'lng': -4.01},
+      'note': 'Bus sans ligne renseignée',
+    });
+    final unassignedReportActivity =
+        (store.snapshot('activity-session')['activity'] as List)
+            .whereType<Map>()
+            .firstWhere(
+              (entry) =>
+                  entry['title'] == 'Signalement enregistré' &&
+                  (entry['subtitle'] as String).contains('Bus 812'),
+            );
+    expect(unassignedReportActivity['subtitle'], isNot(contains('ligne')));
+    final restoredStore = await PiwibusStore.openWithPersistence(
+      JsonFileStatePersistence(File(p.join(tempDir.path, 'state.json'))),
+    );
+    addTearDown(restoredStore.close);
+    final restoredReport =
+        (restoredStore.snapshot('activity-session')['reports'] as List)
+            .whereType<Map>()
+            .firstWhere((entry) => entry['id'] == 'report-without-line');
+    expect(restoredReport['busNumber'], '812');
+    expect(restoredReport['lineCode'], '');
   });
 
   test(
@@ -154,6 +215,21 @@ int _activityCount(PiwibusStore store, String sessionId, [String? title]) {
       .whereType<Map>()
       .where((activity) => title == null || activity['title'] == title)
       .length;
+}
+
+class _CapturingStatePersistence extends JsonFileStatePersistence {
+  _CapturingStatePersistence(super.stateFile);
+
+  final List<StateOutboxEvent> outboxEvents = <StateOutboxEvent>[];
+
+  @override
+  Future<void> applyMutations({
+    required Map<String, dynamic> state,
+    required StateMutationBatch batch,
+  }) async {
+    outboxEvents.addAll(batch.outboxEvents);
+    await super.applyMutations(state: state, batch: batch);
+  }
 }
 
 String _text(Object? value) => value?.toString() ?? '';
