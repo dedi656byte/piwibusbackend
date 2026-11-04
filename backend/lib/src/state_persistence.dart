@@ -238,7 +238,7 @@ class PostgresStatePersistence extends StatePersistence {
         final result = await session.execute(
           Sql.named('''
             WITH candidates AS (
-              SELECT id
+              SELECT event_id
               FROM piwibus_outbox
               WHERE event_type = @event_type
                 AND available_at <= now()
@@ -246,7 +246,7 @@ class PostgresStatePersistence extends StatePersistence {
                   status = 'pending'
                   OR (status = 'processing' AND lease_until <= now())
                 )
-              ORDER BY created_at, id
+              ORDER BY created_at, event_id
               FOR UPDATE SKIP LOCKED
               LIMIT @limit
             )
@@ -256,7 +256,7 @@ class PostgresStatePersistence extends StatePersistence {
                 lease_owner = @worker_id,
                 lease_until = now() + make_interval(secs => @lease_seconds)
             FROM candidates
-            WHERE events.id = candidates.id
+            WHERE events.event_id = candidates.event_id
             RETURNING
               events.event_id, events.event_type, events.payload,
               events.attempts
