@@ -489,12 +489,18 @@ class RedisRealtime {
       _subscription = pubSub.getStream().listen(
         (dynamic event) => _handleMessage(event),
         onError: (Object error, StackTrace stackTrace) {
-          logger.error(
-            'Redis subscription failed',
-            const {},
-            error,
-            stackTrace,
-          );
+          if (_isClosedSubscriptionError(error)) {
+            logger.warning('Redis subscription disconnected; reconnecting', {
+              'reason': error.toString(),
+            });
+          } else {
+            logger.error(
+              'Redis subscription failed',
+              const {},
+              error,
+              stackTrace,
+            );
+          }
           _scheduleReconnect();
         },
         onDone: _scheduleReconnect,
@@ -517,12 +523,25 @@ class RedisRealtime {
     }
   }
 
+  bool _isClosedSubscriptionError(Object error) {
+    final message = error.toString().trim().toLowerCase();
+    return message == 'stream is closed' || message == 'stream closed';
+  }
+
   void _handleMessage(Object event) {
     if (event is! List || event.length < 3) return;
     final kind = event[0]?.toString();
     final channel = event[1]?.toString();
     if (kind == 'subscribe' && channel == config.channel) {
+      final wasReady = _subscriptionReady;
       _subscriptionReady = true;
+      if (!wasReady) {
+        logger.info('Redis subscription ready', {
+          'host': config.host,
+          'port': config.port,
+          'channel': config.channel,
+        });
+      }
       return;
     }
     final payloadText = event[2]?.toString() ?? '';

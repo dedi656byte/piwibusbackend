@@ -83,6 +83,44 @@ void main() {
       await server.close();
     }
   });
+
+  test(
+    'reconnects the Redis subscription after its socket is closed',
+    () async {
+      final server = await _FakeRedisServer.start();
+      final realtime = await RedisRealtime.connect(
+        config: RedisConfig(
+          host: InternetAddress.loopbackIPv4.address,
+          port: server.port,
+          secure: false,
+          username: null,
+          password: null,
+          database: 0,
+          channel: 'test:changes',
+        ),
+        logger: const OpsLogger(),
+      );
+
+      try {
+        await _waitUntil(
+          () => realtime.isSubscriptionReady,
+          reason: 'Redis subscription should become ready',
+        );
+        final subscriptionsBefore = server.subscriptionCount;
+        server.closeSubscriptionConnection();
+
+        await _waitUntil(
+          () =>
+              realtime.isSubscriptionReady &&
+              server.subscriptionCount > subscriptionsBefore,
+          reason: 'Redis subscription should reconnect after a closed socket',
+        );
+      } finally {
+        await realtime.close();
+        await server.close();
+      }
+    },
+  );
 }
 
 Future<void> _waitUntil(
@@ -104,9 +142,14 @@ class _FakeRedisServer {
   final List<Socket> _connections = <Socket>[];
   final Map<Socket, List<String>> _arguments = <Socket, List<String>>{};
   final Map<Socket, int?> _expectedArguments = <Socket, int?>{};
+  final Map<Socket, List<List<String>>> _commandsBySocket =
+      <Socket, List<List<String>>>{};
   final List<List<String>> commands = <List<String>>[];
 
   int get port => _server.port;
+  int get subscriptionCount => commands.where((command) {
+    return command.first.toUpperCase() == 'SUBSCRIBE';
+  }).length;
 
   static Future<_FakeRedisServer> start() async {
     final server = _FakeRedisServer._(
@@ -118,6 +161,15 @@ class _FakeRedisServer {
 
   void closeCommandConnection() {
     _connections.first.destroy();
+  }
+
+  void closeSubscriptionConnection() {
+    final entry = _commandsBySocket.entries.firstWhere(
+      (entry) => entry.value.any(
+        (command) => command.first.toUpperCase() == 'SUBSCRIBE',
+      ),
+    );
+    entry.key.destroy();
   }
 
   Future<void> close() async {
@@ -158,6 +210,7 @@ class _FakeRedisServer {
 
   void _respond(Socket socket, List<String> command) {
     commands.add(command);
+    _commandsBySocket.putIfAbsent(socket, () => <List<String>>[]).add(command);
     switch (command.first.toUpperCase()) {
       case 'PING':
         socket.add(utf8.encode('+PONG\r\n'));
