@@ -187,6 +187,7 @@ class PiwibusStore {
   final StreamController<int> _sharedChanges =
       StreamController<int>.broadcast();
   int _sharedRevision = 0;
+  final int _revisionEpoch = DateTime.now().microsecondsSinceEpoch;
   Future<void> Function()? _publishSharedChange;
   StreamSubscription<void>? _externalChangeSubscription;
   Future<void> _messageSendOperations = Future<void>.value();
@@ -199,6 +200,7 @@ class PiwibusStore {
 
   Stream<int> get sharedChanges => _sharedChanges.stream;
   int get sharedRevision => _sharedRevision;
+  int get revisionEpoch => _revisionEpoch;
   String get storageBackend => _persistence.name;
   bool get isDatabaseBacked => _persistence.isDatabaseBacked;
   bool get supportsGeospatialQueries => _persistence.supportsGeospatialQueries;
@@ -751,6 +753,7 @@ class PiwibusStore {
         session['favoriteLineCodes'] as List,
       ),
       'revision': _sharedRevision,
+      'revisionEpoch': _revisionEpoch,
       'lineDataVersion': _lineDataVersion,
       'lineCount': _lines.length,
       'lines': includeLines ? _lines : const <JsonMap>[],

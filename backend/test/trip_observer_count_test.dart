@@ -40,6 +40,7 @@ void main() {
     await store.selectTrip('reporter-session', 'observer-count-trip');
 
     final ownerSnapshot = store.snapshot('owner-session');
+    expect(ownerSnapshot['revisionEpoch'], store.revisionEpoch);
     final trip = (ownerSnapshot['trips'] as List)
         .cast<Map<String, dynamic>>()
         .singleWhere((trip) => trip['id'] == 'observer-count-trip');

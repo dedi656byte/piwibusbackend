@@ -485,10 +485,13 @@ Future<void> main(List<String> args) async {
     final revision = store.sharedRevision;
     final snapshot = store.snapshot(sessionId);
     final clientSnapshotRevision = _clientSnapshotRevision(request);
+    final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
     final includeLines = _includeLines(request, snapshot);
 
-    if (clientSnapshotRevision == revision && !includeLines) {
-      return _json(_emptyRealtimeDeltaEnvelope(revision));
+    if (clientSnapshotRevision == revision &&
+        clientSnapshotRevisionEpoch == store.revisionEpoch &&
+        !includeLines) {
+      return _json(_emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch));
     }
 
     // Comme pour le WebSocket/SSE, on essaie de renvoyer un delta plutot que
@@ -515,8 +518,12 @@ Future<void> main(List<String> args) async {
           current: currentCursor,
           currentActivity: snapshotForDelta['activity'],
           revision: revision,
+          revisionEpoch: store.revisionEpoch,
         );
-        return _json(envelope ?? _emptyRealtimeDeltaEnvelope(revision));
+        return _json(
+          envelope ??
+              _emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch),
+        );
       }
     }
 
@@ -1677,10 +1684,11 @@ String _contentTypeForPath(String path) {
   };
 }
 
-JsonMap _emptyRealtimeDeltaEnvelope(int revision) {
+JsonMap _emptyRealtimeDeltaEnvelope(int revision, int revisionEpoch) {
   return <String, dynamic>{
     'type': 'snapshotDelta',
     'revision': revision,
+    'revisionEpoch': revisionEpoch,
     'data': const <String, dynamic>{},
   };
 }
@@ -1693,6 +1701,15 @@ int? _clientSnapshotRevision(Request request) {
   if (raw == null) return null;
   final revision = int.tryParse(raw.trim());
   return revision != null && revision >= 0 ? revision : null;
+}
+
+int? _clientSnapshotRevisionEpoch(Request request) {
+  final raw =
+      request.url.queryParameters['snapshotRevisionEpoch'] ??
+      request.url.queryParameters['snapshot_revision_epoch'];
+  if (raw == null) return null;
+  final epoch = int.tryParse(raw.trim());
+  return epoch != null && epoch >= 0 ? epoch : null;
 }
 
 class _RealtimeSnapshotCursor {
@@ -1799,10 +1816,12 @@ class _BoundedSnapshotCursorCache {
 JsonMap _fullRealtimeSnapshotEnvelope({
   required JsonMap current,
   required int revision,
+  required int revisionEpoch,
 }) {
   return <String, dynamic>{
     'type': 'snapshot',
     'revision': revision,
+    'revisionEpoch': revisionEpoch,
     'data': current,
   };
 }
@@ -1812,6 +1831,7 @@ JsonMap? _realtimeDeltaEnvelope({
   required _RealtimeSnapshotCursor current,
   required Object? currentActivity,
   required int revision,
+  required int revisionEpoch,
 }) {
   final set = <String, dynamic>{};
   final keys = <String>{...previous.values.keys, ...current.values.keys};
@@ -1866,6 +1886,7 @@ JsonMap? _realtimeDeltaEnvelope({
   if (set.isEmpty && collections.isEmpty) return null;
   return <String, dynamic>{
     'revision': revision,
+    'revisionEpoch': revisionEpoch,
     if (set.isNotEmpty) 'set': set,
     if (collections.isNotEmpty) 'collections': collections,
   };
@@ -2159,6 +2180,7 @@ Stream<List<int>> _snapshotEventStream(
   Future<String?>? presenceRegistration;
   _RealtimeSnapshotCursor? lastSnapshot;
   final clientSnapshotRevision = _clientSnapshotRevision(request);
+  final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
 
   void addText(String text) {
     if (!controller.isClosed) {
@@ -2178,9 +2200,14 @@ Stream<List<int>> _snapshotEventStream(
       currentSnapshot,
       scope,
     );
-    if (lastSnapshot == null && clientSnapshotRevision == revision) {
+    if (lastSnapshot == null &&
+        clientSnapshotRevision == revision &&
+        clientSnapshotRevisionEpoch == store.revisionEpoch) {
       lastSnapshot = currentCursor;
-      final envelope = _emptyRealtimeDeltaEnvelope(revision);
+      final envelope = _emptyRealtimeDeltaEnvelope(
+        revision,
+        store.revisionEpoch,
+      );
       addText('event: ${envelope['type']}\n');
       addText('data: ${jsonEncode(envelope)}\n\n');
       return;
@@ -2190,12 +2217,14 @@ Stream<List<int>> _snapshotEventStream(
         ? _fullRealtimeSnapshotEnvelope(
             current: currentSnapshot,
             revision: revision,
+            revisionEpoch: store.revisionEpoch,
           )
         : _realtimeDeltaEnvelope(
             previous: previousCursor,
             current: currentCursor,
             currentActivity: currentSnapshot['activity'],
             revision: revision,
+            revisionEpoch: store.revisionEpoch,
           );
     lastSnapshot = currentCursor;
     if (envelope == null) return;
@@ -2354,6 +2383,7 @@ void _handleSnapshotWebSocket(
   Timer? snapshotDebounceTimer;
   _RealtimeSnapshotCursor? lastSnapshot;
   final clientSnapshotRevision = _clientSnapshotRevision(request);
+  final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
   var closed = false;
   Future<String?>? presenceRegistration;
   metrics.webSocketOpened();
@@ -2381,9 +2411,11 @@ void _handleSnapshotWebSocket(
       currentSnapshot,
       scope,
     );
-    if (lastSnapshot == null && clientSnapshotRevision == revision) {
+    if (lastSnapshot == null &&
+        clientSnapshotRevision == revision &&
+        clientSnapshotRevisionEpoch == store.revisionEpoch) {
       lastSnapshot = currentCursor;
-      send(_emptyRealtimeDeltaEnvelope(revision));
+      send(_emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch));
       return;
     }
     final previousCursor = lastSnapshot;
@@ -2391,12 +2423,14 @@ void _handleSnapshotWebSocket(
         ? _fullRealtimeSnapshotEnvelope(
             current: currentSnapshot,
             revision: revision,
+            revisionEpoch: store.revisionEpoch,
           )
         : _realtimeDeltaEnvelope(
             previous: previousCursor,
             current: currentCursor,
             currentActivity: currentSnapshot['activity'],
             revision: revision,
+            revisionEpoch: store.revisionEpoch,
           );
     lastSnapshot = currentCursor;
     if (envelope == null) return;
