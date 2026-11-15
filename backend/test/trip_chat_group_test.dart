@@ -136,6 +136,26 @@ void main() {
         <String>['rating-owner-push-token-0001'],
       );
       await store.rateTrip('rating-author-session', 'trip-rating-test', 5);
+      final authorTrip =
+          (store.snapshot('rating-author-session')['trips'] as List)
+              .cast<Map>()
+              .single;
+      final observerTrip =
+          (store.snapshot('rating-observer-session')['trips'] as List)
+              .cast<Map>()
+              .single;
+      expect(authorTrip['currentUserRating'], 5);
+      expect(authorTrip.containsKey('ratingScoresByActorId'), isFalse);
+      expect(observerTrip['currentUserRating'], isNull);
+      final restoredStore = await PiwibusStore.openWithPersistence(
+        JsonFileStatePersistence(persistence.stateFile),
+      );
+      addTearDown(restoredStore.close);
+      final restoredAuthorTrip =
+          (restoredStore.snapshot('rating-author-session')['trips'] as List)
+              .cast<Map>()
+              .single;
+      expect(restoredAuthorTrip['currentUserRating'], 5);
 
       final ownerActivity =
           store.snapshot('rating-owner-session')['activity'] as List;
@@ -888,9 +908,8 @@ Future<(PiwibusStore, _CapturingStatePersistence)> _openCapturingTempStore(
   String prefix,
 ) async {
   final tempDir = await Directory.systemTemp.createTemp(prefix);
-  final persistence = _CapturingStatePersistence(
-    File(p.join(tempDir.path, 'state.json')),
-  );
+  final stateFile = File(p.join(tempDir.path, 'state.json'));
+  final persistence = _CapturingStatePersistence(stateFile);
   final store = await PiwibusStore.openWithPersistence(persistence);
   addTearDown(() async {
     await store.close();
@@ -902,8 +921,9 @@ Future<(PiwibusStore, _CapturingStatePersistence)> _openCapturingTempStore(
 }
 
 class _CapturingStatePersistence extends JsonFileStatePersistence {
-  _CapturingStatePersistence(super.stateFile);
+  _CapturingStatePersistence(this.stateFile) : super(stateFile);
 
+  final File stateFile;
   final List<StateOutboxEvent> outboxEvents = <StateOutboxEvent>[];
 
   @override

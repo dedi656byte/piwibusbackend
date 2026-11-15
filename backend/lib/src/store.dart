@@ -752,6 +752,13 @@ class PiwibusStore {
       'favoriteLineCodes': List<String>.from(
         session['favoriteLineCodes'] as List,
       ),
+      'currentUserReceivedLikeCount': currentUser == null
+          ? null
+          : allTrips
+                .where(
+                  (trip) => _text(trip['owner_id']) == _text(currentUser['id']),
+                )
+                .fold(0, (total, trip) => total + _tripLikeCount(trip)),
       'revision': _sharedRevision,
       'revisionEpoch': _revisionEpoch,
       'lineDataVersion': _lineDataVersion,
@@ -3791,6 +3798,8 @@ class PiwibusStore {
       ),
       'ratingAverage': 0,
       'ratingCount': 0,
+      'ratedByActorIds': <String>[],
+      'ratingScoresByActorId': <String, int>{},
       'likedByActorIds': <String>[],
       'note': note.isEmpty
           ? 'Trajet partagé en direct depuis le terrain.'
@@ -4525,6 +4534,10 @@ class PiwibusStore {
     trip['ratingAverage'] = (total + score) / count;
     trip['ratingCount'] = count;
     trip['ratedByActorIds'] = <String>[...ratedByActorIds, actorId]..sort();
+    final ratingScores = _normalizeRatingScores(
+      trip['ratingScoresByActorId'] ?? trip['rating_scores_by_actor_id'],
+    )..[actorId] = score;
+    trip['ratingScoresByActorId'] = ratingScores;
     trip['lastUpdatedAt'] = _nowIso();
     final activityAudience = notificationAudienceForTripOwner(
       tripId,
@@ -5337,9 +5350,14 @@ class PiwibusStore {
       ratedByActorIds,
       sessionId,
     );
+    public['currentUserRating'] = _tripRatingForSession(trip, sessionId);
     public['lastSystemMessage'] = _lastSystemMessage(trip);
     public.remove('likedByActorIds');
     public.remove('liked_by_actor_ids');
+    public.remove('ratingScoresByActorId');
+    public.remove('rating_scores_by_actor_id');
+    public.remove('ratedByActorIds');
+    public.remove('rated_by_actor_ids');
     if (!includeAdminTelemetry) {
       public.remove('networkUsageBytes');
       public.remove('network_usage_bytes');
@@ -5366,6 +5384,10 @@ class PiwibusStore {
     public['path'] = const <JsonMap>[];
     public['likeCount'] = _tripLikeCount(trip);
     public['likedByCurrentUser'] = false;
+    public.remove('ratingScoresByActorId');
+    public.remove('rating_scores_by_actor_id');
+    public.remove('ratedByActorIds');
+    public.remove('rated_by_actor_ids');
     public.remove('likedByActorIds');
     public.remove('liked_by_actor_ids');
     public.remove('owner_session_id');
@@ -6039,6 +6061,8 @@ class PiwibusStore {
   }
 
   JsonMap _normalizeTrip(JsonMap input) {
+    final rawRatingScores =
+        input['ratingScoresByActorId'] ?? input['rating_scores_by_actor_id'];
     return <String, dynamic>{
       'id': _text(input['id']),
       'line_code': _normalizeCode(_text(input['line_code'])),
@@ -6070,6 +6094,10 @@ class PiwibusStore {
       'networkUsageBytes': _int(input['networkUsageBytes']),
       'ratingAverage': _double(input['ratingAverage']),
       'ratingCount': _int(input['ratingCount']),
+      'ratedByActorIds': _stringList(
+        input['ratedByActorIds'] ?? input['rated_by_actor_ids'],
+      ),
+      'ratingScoresByActorId': _normalizeRatingScores(rawRatingScores),
       'likedByActorIds': _stringList(
         input['likedByActorIds'] ?? input['liked_by_actor_ids'],
       ),
@@ -6824,6 +6852,19 @@ class PiwibusStore {
         .toList();
   }
 
+  Map<String, int> _normalizeRatingScores(Object? value) {
+    if (value is! Map) return <String, int>{};
+    final scores = <String, int>{};
+    for (final entry in value.entries) {
+      final actorId = _text(entry.key);
+      final score = _int(entry.value);
+      if (actorId.isNotEmpty && score >= 1 && score <= 5) {
+        scores[actorId] = score;
+      }
+    }
+    return scores;
+  }
+
   List<JsonMap> _users() => _mapList(_state['users']);
   List<JsonMap> _trips() => _mapList(_state['trips']);
   List<JsonMap> _reports() => _mapList(_state['reports']);
@@ -7189,6 +7230,14 @@ class PiwibusStore {
   bool _tripRatedBySession(List<String> ratedByActorIds, String sessionId) {
     return ratedByActorIds.contains(_tripRatingActorId(sessionId)) ||
         ratedByActorIds.contains(_tripSessionLikeActorId(sessionId));
+  }
+
+  int? _tripRatingForSession(JsonMap trip, String sessionId) {
+    final scores = _normalizeRatingScores(
+      trip['ratingScoresByActorId'] ?? trip['rating_scores_by_actor_id'],
+    );
+    return scores[_tripRatingActorId(sessionId)] ??
+        scores[_tripSessionLikeActorId(sessionId)];
   }
 
   JsonMap? _currentUser(JsonMap session) {
