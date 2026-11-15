@@ -85,13 +85,22 @@ class PushOutboxWorker {
               (key, value) => MapEntry(key.toString(), value.toString()),
             )
           : <String, String>{};
-      final delivered = await pushNotifications.sendToTokensWithResult(
+      final result = await pushNotifications.sendToTokensWithResult(
         tokens: store.pushTokensForOutboxEvent(payload),
         title: payload['title']?.toString() ?? '',
         body: payload['body']?.toString() ?? '',
         data: data,
       );
-      if (!delivered) {
+      if (result.invalidTokens.isNotEmpty) {
+        final disabledCount = await store.disablePushTokens(
+          result.invalidTokens,
+        );
+        logger.warning('Invalid FCM tokens disabled', <String, Object?>{
+          'eventId': event.id,
+          'tokenCount': disabledCount,
+        });
+      }
+      if (result.hasRetryableFailures) {
         throw StateError('One or more FCM deliveries failed.');
       }
       await store.markOutboxEventPublished(

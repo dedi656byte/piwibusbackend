@@ -1055,6 +1055,40 @@ class PiwibusStore {
     return tokens.toList(growable: false);
   }
 
+  Future<int> disablePushTokens(Iterable<String> tokens) async {
+    final invalidTokens = tokens
+        .map((token) => token.trim())
+        .where((token) => token.isNotEmpty)
+        .toSet();
+    if (invalidTokens.isEmpty) return 0;
+
+    final previousTokens = _state['pushTokens'];
+    final pushTokens = _mapList(previousTokens);
+    var disabledCount = 0;
+    final updatedTokens = pushTokens
+        .map((token) {
+          if (invalidTokens.contains(_text(token['token'])) &&
+              _text(token['status']) != 'disabled') {
+            disabledCount += 1;
+            return <String, dynamic>{...token, 'status': 'disabled'};
+          }
+          return token;
+        })
+        .toList(growable: false);
+    if (disabledCount == 0) return 0;
+
+    _state['pushTokens'] = updatedTokens;
+    try {
+      await _persist(const StateMutationBatch(pushTokens: true));
+    } catch (_) {
+      if (identical(_state['pushTokens'], updatedTokens)) {
+        _state['pushTokens'] = previousTokens;
+      }
+      rethrow;
+    }
+    return disabledCount;
+  }
+
   JsonMap? lastMessageForConversation(String conversationId) {
     final convId = _text(conversationId);
     if (convId.isEmpty) return null;

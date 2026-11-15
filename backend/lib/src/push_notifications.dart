@@ -6,12 +6,24 @@ import 'package:http/http.dart' as http;
 
 import 'ops_logger.dart';
 
+class PushNotificationDeliveryResult {
+  const PushNotificationDeliveryResult({
+    this.invalidTokens = const <String>{},
+    this.hasRetryableFailures = false,
+  });
+
+  final Set<String> invalidTokens;
+  final bool hasRetryableFailures;
+}
+
 class PushNotificationService {
   PushNotificationService._({
     required this.projectId,
     required this.logger,
     http.Client? client,
-  }) : _client = client ?? http.Client();
+    http.Client? authorizedClient,
+  }) : _client = client ?? http.Client(),
+       _authorizedClient = authorizedClient;
 
   static const _firebaseMessagingScope =
       'https://www.googleapis.com/auth/firebase.messaging';
@@ -22,6 +34,18 @@ class PushNotificationService {
   http.Client? _authorizedClient;
 
   bool get enabled => projectId.isNotEmpty;
+
+  factory PushNotificationService.forTesting({
+    required String projectId,
+    required OpsLogger logger,
+    required http.Client authorizedClient,
+  }) {
+    return PushNotificationService._(
+      projectId: projectId,
+      logger: logger,
+      authorizedClient: authorizedClient,
+    );
+  }
 
   static PushNotificationService fromEnvironment({required OpsLogger logger}) {
     return PushNotificationService._(
@@ -49,7 +73,7 @@ class PushNotificationService {
     );
   }
 
-  Future<bool> sendToTokensWithResult({
+  Future<PushNotificationDeliveryResult> sendToTokensWithResult({
     required Iterable<String> tokens,
     required String title,
     required String body,
@@ -59,13 +83,18 @@ class PushNotificationService {
         .map((token) => token.trim())
         .where((token) => token.isNotEmpty)
         .toSet();
-    if (!enabled || uniqueTokens.isEmpty) return true;
+    if (!enabled || uniqueTokens.isEmpty) {
+      return const PushNotificationDeliveryResult();
+    }
 
     final authorizedClient = await _authorizedHttpClient();
-    if (authorizedClient == null) return false;
+    if (authorizedClient == null) {
+      return const PushNotificationDeliveryResult(hasRetryableFailures: true);
+    }
 
     final eventId = data['eventId']?.trim() ?? '';
-    var succeeded = true;
+    final invalidTokens = <String>{};
+    var hasRetryableFailures = false;
     for (final token in uniqueTokens) {
       try {
         final response = await authorizedClient.post(
@@ -95,18 +124,55 @@ class PushNotificationService {
           }),
         );
         if (response.statusCode < 200 || response.statusCode >= 300) {
-          succeeded = false;
+          final fcmError = _parseFcmError(response.body);
+          if (response.statusCode == 404 &&
+              fcmError.errorCode == 'UNREGISTERED') {
+            invalidTokens.add(token);
+            logger.warning('FCM token is unregistered', <String, Object?>{
+              'statusCode': response.statusCode,
+              'fcmStatus': fcmError.status,
+              'fcmErrorCode': fcmError.errorCode,
+            });
+            continue;
+          }
+          hasRetryableFailures = true;
           logger.warning('FCM push failed', <String, Object?>{
             'statusCode': response.statusCode,
-            'body': response.body,
+            'fcmStatus': fcmError.status,
+            'fcmErrorCode': fcmError.errorCode,
           });
         }
       } catch (error, stackTrace) {
-        succeeded = false;
+        hasRetryableFailures = true;
         logger.error('FCM push exception', const {}, error, stackTrace);
       }
     }
-    return succeeded;
+    return PushNotificationDeliveryResult(
+      invalidTokens: invalidTokens,
+      hasRetryableFailures: hasRetryableFailures,
+    );
+  }
+
+  ({String? status, String? errorCode}) _parseFcmError(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is! Map) return (status: null, errorCode: null);
+      final error = decoded['error'];
+      if (error is! Map) return (status: null, errorCode: null);
+      final details = error['details'];
+      final errorCode = details is Iterable
+          ? details
+                .whereType<Map>()
+                .map((detail) => detail['errorCode']?.toString())
+                .firstWhere(
+                  (code) => code != null && code.isNotEmpty,
+                  orElse: () => null,
+                )
+          : null;
+      return (status: error['status']?.toString(), errorCode: errorCode);
+    } on FormatException {
+      return (status: null, errorCode: null);
+    }
   }
 
   Future<http.Client?> _authorizedHttpClient() async {
