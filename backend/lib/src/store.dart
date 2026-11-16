@@ -2240,6 +2240,122 @@ class PiwibusStore {
     return _messageConversationsForSession(currentUser);
   }
 
+  Future<JsonMap> sendBroadcastMessage(String sessionId, JsonMap body) async {
+    _requireAdmin(sessionId);
+    final senderId = _authenticatedUserId(sessionId);
+    final messageType = _text(body['type']);
+    if (messageType.isNotEmpty && messageType != 'app_update') {
+      throw StateError('Type de message invalide.');
+    }
+    final isAppUpdate = messageType == 'app_update';
+    final appVersion = isAppUpdate ? _text(body['appVersion']).trim() : '';
+    if (isAppUpdate &&
+        (appVersion.length > 32 ||
+            !RegExp(r'^\d+\.\d+\.\d+(?:\+\d+)?$').hasMatch(appVersion))) {
+      throw StateError(
+        'Version invalide. Utilisez le format 8.42.0 ou 8.42.0+3075.',
+      );
+    }
+    final text = isAppUpdate
+        ? 'télécharger la nouvelle version en cliquant sur ce message'
+        : _boundedText(
+            body['body'] ?? body['text'] ?? body['message'],
+            _maxMessageLength,
+            fieldName: 'Message',
+          );
+    if (text.trim().isEmpty) throw StateError('Le message est vide.');
+
+    final recipientUserIds = _users()
+        .map((user) => _text(user['id']))
+        .where((userId) => userId.isNotEmpty && userId != senderId)
+        .toSet()
+        .toList(growable: false);
+    final participantIds = <String>{senderId, ...recipientUserIds}.toList()
+      ..sort();
+    final createdAt = _nowIso();
+    final conversationId = _newEntityId('msgc');
+    final messageId = _newEntityId('msg');
+    final message = <String, dynamic>{
+      'id': messageId,
+      'conversationId': conversationId,
+      'senderId': senderId,
+      'senderName': 'piwibus',
+      'body': text.trim(),
+      if (isAppUpdate) 'type': 'app_update',
+      if (isAppUpdate) 'appVersion': appVersion,
+      'sequence': 1,
+      'createdAt': createdAt,
+    };
+    final conversation = <String, dynamic>{
+      'id': conversationId,
+      'kind': 'broadcast',
+      'broadcastSenderId': senderId,
+      'participantIds': participantIds,
+      'title': '',
+      'subtitle': '',
+      'lastMessagePreview': _messagePreview(text),
+      'lastMessageId': messageId,
+      'lastSenderId': senderId,
+      'messageCursor': 1,
+      'messageRevision': 0,
+      'readSequences': <String, int>{
+        for (final participantId in participantIds)
+          participantId: participantId == senderId ? 1 : 0,
+      },
+      'readReceiptSequences': <String, int>{
+        for (final participantId in participantIds) participantId: 0,
+      },
+      'deliveredSequences': <String, int>{
+        for (final participantId in participantIds)
+          participantId: participantId == senderId ? 1 : 0,
+      },
+      'createdAt': createdAt,
+      'updatedAt': createdAt,
+      'messages': <JsonMap>[],
+    };
+    _advanceMessageRevision(conversation, message);
+    conversation['messages'] = <JsonMap>[message];
+
+    final updatedState = <String, dynamic>{
+      ..._state,
+      'messageConversations': <JsonMap>[
+        conversation,
+        ..._messageConversations(),
+      ],
+    };
+    final pushEvent = createPushOutboxEvent(
+      eventId: 'message:$conversationId:$messageId',
+      title: 'Nouveau message de piwibus',
+      body: _messagePreview(text),
+      data: <String, String>{
+        'type': 'message_created',
+        'conversationId': conversationId,
+        'messageId': messageId,
+        'senderId': senderId,
+        'createdAt': createdAt,
+      },
+      audienceUserIds: recipientUserIds,
+    );
+    await _persist(
+      StateMutationBatch(
+        messageConversations: true,
+        outboxEvents: <StateOutboxEvent>[if (pushEvent != null) pushEvent],
+      ),
+      state: updatedState,
+    );
+    _state = updatedState;
+
+    return <String, dynamic>{
+      'conversation': _publicMessageConversation(
+        conversation,
+        currentUserId: senderId,
+        usersById: _usersById(),
+      ),
+      'message': _publicMessageItem(message, currentUserId: senderId),
+      'recipientUserIds': recipientUserIds,
+    };
+  }
+
   Future<JsonMap> startMessageConversation(
     String sessionId,
     JsonMap body,
@@ -2467,14 +2583,19 @@ class PiwibusStore {
     final otherParticipantIds = _stringList(
       conversation['participantIds'],
     ).where((id) => id != currentUserId).toList(growable: false);
-    final deliveredThrough = otherParticipantIds.fold<int>(
-      0,
-      (max, id) => math.max(max, deliveredSequences[id] ?? 0),
-    );
-    final readThrough = otherParticipantIds.fold<int>(
-      0,
-      (max, id) => math.max(max, readReceiptSequences[id] ?? 0),
-    );
+    final isBroadcast = _text(conversation['kind']) == 'broadcast';
+    final deliveredThrough = isBroadcast
+        ? 0
+        : otherParticipantIds.fold<int>(
+            0,
+            (max, id) => math.max(max, deliveredSequences[id] ?? 0),
+          );
+    final readThrough = isBroadcast
+        ? 0
+        : otherParticipantIds.fold<int>(
+            0,
+            (max, id) => math.max(max, readReceiptSequences[id] ?? 0),
+          );
     final normalizedLimit = limit.clamp(1, _maxMessagePageLimit).toInt();
     final messages = _mapList(conversation['messages'])
       ..sort((a, b) {
@@ -2510,12 +2631,14 @@ class PiwibusStore {
             message,
             currentUserId: currentUserId,
             tripOwnerUserId: _tripOwnerUserIdForConversation(conversation),
-            deliveryState: _messageDeliveryState(
-              message,
-              currentUserId: currentUserId,
-              deliveredThrough: deliveredThrough,
-              readThrough: readThrough,
-            ),
+            deliveryState: isBroadcast
+                ? 'sent'
+                : _messageDeliveryState(
+                    message,
+                    currentUserId: currentUserId,
+                    deliveredThrough: deliveredThrough,
+                    readThrough: readThrough,
+                  ),
           ),
         )
         .toList(growable: false);
@@ -2552,6 +2675,11 @@ class PiwibusStore {
     if (index < 0) throw StateError('Conversation introuvable.');
     final conversation = conversations[index];
     final conversationTripId = _text(conversation['tripId']);
+    if (_text(conversation['kind']) == 'broadcast') {
+      throw StateError(
+        'Les annonces générales ne peuvent pas recevoir de réponse.',
+      );
+    }
     final conversationTrip = _text(conversation['kind']) == 'trip'
         ? _trips().firstWhere(
             (trip) => _text(trip['id']) == conversationTripId,
@@ -5167,6 +5295,9 @@ class PiwibusStore {
     required String currentUserId,
     required Map<String, JsonMap> usersById,
   }) {
+    final kind = _text(conversation['kind']).isEmpty
+        ? 'direct'
+        : _text(conversation['kind']);
     final participantIds = _stringList(conversation['participantIds']);
     final peerUserId = participantIds.firstWhere(
       (id) => id != currentUserId,
@@ -5180,30 +5311,44 @@ class PiwibusStore {
     final otherParticipantIds = participantIds
         .where((id) => id != currentUserId)
         .toList(growable: false);
-    final deliveredThrough = otherParticipantIds.fold<int>(
-      0,
-      (max, participantId) =>
-          math.max(max, deliveredSequences[participantId] ?? 0),
-    );
-    final recipientReadThrough = otherParticipantIds.fold<int>(
-      0,
-      (max, participantId) =>
-          math.max(max, readReceiptSequences[participantId] ?? 0),
-    );
+    final isBroadcast = _text(conversation['kind']) == 'broadcast';
+    final deliveredThrough = isBroadcast
+        ? 0
+        : otherParticipantIds.fold<int>(
+            0,
+            (max, participantId) =>
+                math.max(max, deliveredSequences[participantId] ?? 0),
+          );
+    final recipientReadThrough = isBroadcast
+        ? 0
+        : otherParticipantIds.fold<int>(
+            0,
+            (max, participantId) =>
+                math.max(max, readReceiptSequences[participantId] ?? 0),
+          );
     final readThrough = readSequences[currentUserId] ?? 0;
     final unreadCount = math.max(
       0,
       _int(conversation['messageCursor']) - readThrough,
     );
-    final peerUser = usersById[peerUserId];
-    final kind = _text(conversation['kind']).isEmpty
-        ? 'direct'
-        : _text(conversation['kind']);
-    final title = _text(conversation['title']).isNotEmpty
+    final peerUser = kind == 'broadcast' ? null : usersById[peerUserId];
+    final isBroadcastSender =
+        kind == 'broadcast' &&
+        _text(conversation['broadcastSenderId']) == currentUserId;
+    final title = kind == 'broadcast'
+        ? isBroadcastSender
+              ? 'Annonce à tous'
+              : 'piwibus'
+        : _text(conversation['title']).isNotEmpty
         ? _text(conversation['title'])
         : kind == 'direct' && peerUser != null
         ? _text(peerUser['fullName'])
         : 'Conversation trajet';
+    final subtitle = kind == 'broadcast'
+        ? isBroadcastSender
+              ? 'Envoyée à tous les comptes inscrits'
+              : 'Annonce générale'
+        : _text(conversation['subtitle']);
     final tripOwnerUserId = _tripOwnerUserIdForConversation(conversation);
     final pinnedMessages = _mapList(conversation['messages'])
         .where((message) => _text(message['pinnedBy']).isNotEmpty)
@@ -5218,7 +5363,7 @@ class PiwibusStore {
     return <String, dynamic>{
       'id': _text(conversation['id']),
       'kind': kind,
-      'participantIds': participantIds,
+      'participantIds': isBroadcast ? <String>[currentUserId] : participantIds,
       if (_text(conversation['tripId']).isNotEmpty)
         'tripId': _text(conversation['tripId']),
       'peerUser': peerUser == null
@@ -5228,7 +5373,7 @@ class PiwibusStore {
               includeProfilePhotoDataUrl: kind == 'direct',
             ),
       'title': title,
-      'subtitle': _text(conversation['subtitle']),
+      'subtitle': subtitle,
       'lastMessagePreview': _text(conversation['lastMessagePreview']),
       if (_text(conversation['lastMessageId']).isNotEmpty)
         'lastMessageId': _text(conversation['lastMessageId']),
@@ -5318,6 +5463,11 @@ class PiwibusStore {
         'pinnedAt': _text(message['pinnedAt']),
         'canUnpin':
             pinnedBy == currentUserId || tripOwnerUserId == currentUserId,
+      },
+      if (!isDeleted &&
+          _text(message['type']) == 'app_update') ...<String, dynamic>{
+        'type': 'app_update',
+        'appVersion': _text(message['appVersion']),
       },
     };
   }
@@ -6253,6 +6403,10 @@ class PiwibusStore {
       'senderId': _text(input['senderId'] ?? input['sender_id']),
       'senderName': _text(input['senderName'] ?? input['sender_name']),
       'body': body,
+      if (_text(input['type']) == 'app_update') 'type': 'app_update',
+      if (_text(input['type']) == 'app_update' &&
+          _text(input['appVersion'] ?? input['app_version']).isNotEmpty)
+        'appVersion': _text(input['appVersion'] ?? input['app_version']),
       'isDeleted': input['isDeleted'] == true || input['is_deleted'] == true,
       if (_text(input['deletedAt'] ?? input['deleted_at']).isNotEmpty)
         'deletedAt': _text(input['deletedAt'] ?? input['deleted_at']),

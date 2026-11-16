@@ -1006,6 +1006,17 @@ Future<void> main(List<String> args) async {
     );
   });
 
+  router.post('/messages/broadcasts', (Request request) async {
+    try {
+      final sessionId = await sessionIdFor(request);
+      final body = await _readJson(request, maxBytes: _maxJsonBodyBytes);
+      final result = await store.sendBroadcastMessage(sessionId, body);
+      return _json(result);
+    } catch (error) {
+      return _errorForException(error);
+    }
+  });
+
   router.get('/messages/conversations/<id>/messages', (
     Request request,
     String id,
