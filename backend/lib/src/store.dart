@@ -2240,7 +2240,21 @@ class PiwibusStore {
     return _messageConversationsForSession(currentUser);
   }
 
-  Future<JsonMap> sendBroadcastMessage(String sessionId, JsonMap body) async {
+  Future<JsonMap> sendBroadcastMessage(String sessionId, JsonMap body) {
+    final previousOperation = _messageSendOperations;
+    final operationFinished = Completer<void>();
+    _messageSendOperations = operationFinished.future;
+    return () async {
+      await previousOperation;
+      try {
+        return await _sendBroadcastMessage(sessionId, body);
+      } finally {
+        operationFinished.complete();
+      }
+    }();
+  }
+
+  Future<JsonMap> _sendBroadcastMessage(String sessionId, JsonMap body) async {
     _requireAdmin(sessionId);
     final senderId = _authenticatedUserId(sessionId);
     final messageType = _text(body['type']);
@@ -2273,7 +2287,40 @@ class PiwibusStore {
     final participantIds = <String>{senderId, ...recipientUserIds}.toList()
       ..sort();
     final createdAt = _nowIso();
-    final conversationId = _newEntityId('msgc');
+    final conversations = _mapList(_state['messageConversations']);
+    _mergeBroadcastConversations(conversations);
+    var conversation = conversations.firstWhere(
+      (item) => _text(item['kind']) == 'broadcast',
+      orElse: () => <String, dynamic>{},
+    );
+    if (conversation.isEmpty) {
+      conversation = <String, dynamic>{
+        'id': _newEntityId('msgc'),
+        'kind': 'broadcast',
+        'broadcastSenderId': senderId,
+        'participantIds': participantIds,
+        'title': '',
+        'subtitle': '',
+        'lastMessagePreview': '',
+        'messageCursor': 0,
+        'messageRevision': 0,
+        'readSequences': <String, int>{
+          for (final participantId in participantIds) participantId: 0,
+        },
+        'readReceiptSequences': <String, int>{
+          for (final participantId in participantIds) participantId: 0,
+        },
+        'deliveredSequences': <String, int>{
+          for (final participantId in participantIds) participantId: 0,
+        },
+        'createdAt': createdAt,
+        'updatedAt': createdAt,
+        'messages': <JsonMap>[],
+      };
+      conversations.insert(0, conversation);
+    }
+    final conversationId = _text(conversation['id']);
+    final nextSequence = _int(conversation['messageCursor']) + 1;
     final messageId = _newEntityId('msg');
     final message = <String, dynamic>{
       'id': messageId,
@@ -2283,45 +2330,29 @@ class PiwibusStore {
       'body': text.trim(),
       if (isAppUpdate) 'type': 'app_update',
       if (isAppUpdate) 'appVersion': appVersion,
-      'sequence': 1,
+      'sequence': nextSequence,
       'createdAt': createdAt,
     };
-    final conversation = <String, dynamic>{
-      'id': conversationId,
-      'kind': 'broadcast',
-      'broadcastSenderId': senderId,
-      'participantIds': participantIds,
-      'title': '',
-      'subtitle': '',
-      'lastMessagePreview': _messagePreview(text),
-      'lastMessageId': messageId,
-      'lastSenderId': senderId,
-      'messageCursor': 1,
-      'messageRevision': 0,
-      'readSequences': <String, int>{
-        for (final participantId in participantIds)
-          participantId: participantId == senderId ? 1 : 0,
-      },
-      'readReceiptSequences': <String, int>{
-        for (final participantId in participantIds) participantId: 0,
-      },
-      'deliveredSequences': <String, int>{
-        for (final participantId in participantIds)
-          participantId: participantId == senderId ? 1 : 0,
-      },
-      'createdAt': createdAt,
-      'updatedAt': createdAt,
-      'messages': <JsonMap>[],
-    };
+    conversation
+      ..['participantIds'] = participantIds
+      ..['broadcastSenderId'] = senderId
+      ..['messageCursor'] = nextSequence
+      ..['lastMessageId'] = messageId
+      ..['lastSenderId'] = senderId
+      ..['lastMessagePreview'] = _messagePreview(text)
+      ..['updatedAt'] = createdAt;
+    final readSequences = _sequenceMap(conversation['readSequences']);
+    readSequences[senderId] = nextSequence;
+    conversation['readSequences'] = readSequences;
     _advanceMessageRevision(conversation, message);
-    conversation['messages'] = <JsonMap>[message];
+    conversation['messages'] = <JsonMap>[
+      ..._mapList(conversation['messages']),
+      message,
+    ];
 
     final updatedState = <String, dynamic>{
       ..._state,
-      'messageConversations': <JsonMap>[
-        conversation,
-        ..._messageConversations(),
-      ],
+      'messageConversations': conversations,
     };
     final pushEvent = createPushOutboxEvent(
       eventId: 'message:$conversationId:$messageId',
@@ -6052,7 +6083,101 @@ class PiwibusStore {
       ).map(_normalizeMessageConversation).toList(),
     };
 
+    final normalizedBroadcasts = _mapList(output['messageConversations']);
+    _mergeBroadcastConversations(normalizedBroadcasts);
+    output['messageConversations'] = normalizedBroadcasts;
     return pruneLegacyFixtures ? _pruneLegacyFixtures(output) : output;
+  }
+
+  void _mergeBroadcastConversations(List<JsonMap> conversations) {
+    final broadcasts = conversations
+        .where((conversation) => _text(conversation['kind']) == 'broadcast')
+        .toList(growable: false);
+    if (broadcasts.length < 2) return;
+
+    broadcasts.sort((a, b) {
+      final createdOrder = _text(
+        a['createdAt'],
+      ).compareTo(_text(b['createdAt']));
+      if (createdOrder != 0) return createdOrder;
+      return _text(a['id']).compareTo(_text(b['id']));
+    });
+    final canonical = broadcasts.first;
+    final entries =
+        <({JsonMap message, JsonMap conversation})>[
+          for (final conversation in broadcasts)
+            for (final message in _mapList(conversation['messages']))
+              (message: message, conversation: conversation),
+        ]..sort((a, b) {
+          final createdOrder = _text(
+            a.message['createdAt'],
+          ).compareTo(_text(b.message['createdAt']));
+          if (createdOrder != 0) return createdOrder;
+          final sequenceOrder = _int(
+            a.message['sequence'],
+          ).compareTo(_int(b.message['sequence']));
+          if (sequenceOrder != 0) return sequenceOrder;
+          return _text(a.message['id']).compareTo(_text(b.message['id']));
+        });
+
+    final participants = <String>{
+      for (final conversation in broadcasts)
+        ..._stringList(conversation['participantIds']),
+    }.toList(growable: false)..sort();
+    int contiguousThrough(String participantId, String sequenceField) {
+      var through = 0;
+      for (final entry in entries) {
+        final messageSequence = _int(entry.message['sequence']);
+        final reachedSequence = _int(
+          _sequenceMap(entry.conversation[sequenceField])[participantId],
+        );
+        if (messageSequence > reachedSequence) break;
+        through += 1;
+      }
+      return through;
+    }
+
+    final messages = <JsonMap>[];
+    for (var index = 0; index < entries.length; index += 1) {
+      messages.add(<String, dynamic>{
+        ...entries[index].message,
+        'conversationId': _text(canonical['id']),
+        'sequence': index + 1,
+        'updateRevision': index + 1,
+      });
+    }
+    final latestMessage = messages.isEmpty ? null : messages.last;
+    final senderId = _text(canonical['broadcastSenderId']);
+    canonical
+      ..['participantIds'] = participants
+      ..['messages'] = messages
+      ..['messageCursor'] = messages.length
+      ..['messageRevision'] = messages.length
+      ..['readSequences'] = <String, int>{
+        for (final participantId in participants)
+          participantId: participantId == senderId
+              ? messages.length
+              : contiguousThrough(participantId, 'readSequences'),
+      }
+      ..['readReceiptSequences'] = <String, int>{
+        for (final participantId in participants)
+          participantId: contiguousThrough(
+            participantId,
+            'readReceiptSequences',
+          ),
+      }
+      ..['deliveredSequences'] = <String, int>{
+        for (final participantId in participants)
+          participantId: contiguousThrough(participantId, 'deliveredSequences'),
+      }
+      ..['lastMessageId'] = _text(latestMessage?['id'])
+      ..['lastSenderId'] = _text(latestMessage?['senderId'])
+      ..['lastMessagePreview'] = _messagePreview(_text(latestMessage?['body']))
+      ..['updatedAt'] = _text(latestMessage?['createdAt']);
+
+    conversations
+      ..removeWhere((conversation) => broadcasts.contains(conversation))
+      ..insert(0, canonical);
   }
 
   JsonMap _pruneLegacyFixtures(JsonMap state) {
@@ -6344,6 +6469,9 @@ class PiwibusStore {
     return <String, dynamic>{
       'id': _text(input['id']),
       'kind': _text(input['kind']).isEmpty ? 'direct' : _text(input['kind']),
+      'broadcastSenderId': _nullableText(
+        input['broadcastSenderId'] ?? input['broadcast_sender_id'],
+      ),
       'participantIds': participantIds,
       'tripId': _nullableText(input['tripId'] ?? input['trip_id']),
       'tripOwnerUserId': _nullableText(

@@ -132,14 +132,24 @@ void main() {
       expect(updateMessage['appVersion'], '8.42.1+3076');
       final updateConversation =
           updateResult['conversation'] as Map<String, dynamic>;
+      expect(updateConversation['id'], conversationId);
+      expect(
+        store
+            .messageConversationsForSession('active-recipient-session')
+            .where((item) => item['kind'] == 'broadcast'),
+        hasLength(1),
+      );
       final receivedUpdate = store
-          .conversationMessages(
-            'active-recipient-session',
-            updateConversation['id'] as String,
-          )
-          .single;
+          .conversationMessages('active-recipient-session', conversationId)
+          .last;
       expect(receivedUpdate['type'], 'app_update');
       expect(receivedUpdate['appVersion'], '8.42.1+3076');
+      expect(
+        store
+            .conversationMessages('active-recipient-session', conversationId)
+            .map((item) => item['sequence']),
+        <int>[1, 2],
+      );
 
       await expectLater(
         store.sendBroadcastMessage('broadcast-admin-session', <String, dynamic>{
@@ -148,6 +158,127 @@ void main() {
         }),
         throwsA(isA<StateError>()),
       );
+
+      final persistedState =
+          jsonDecode(await stateFile.readAsString()) as Map<String, dynamic>;
+      final persistedConversations =
+          persistedState['messageConversations'] as List;
+      final canonicalConversation = Map<String, dynamic>.from(
+        persistedConversations.single as Map,
+      );
+      final originalMessages = canonicalConversation['messages'] as List;
+      final originalMessage = Map<String, dynamic>.from(
+        originalMessages.first as Map,
+      );
+      final legacyUpdateMessage = Map<String, dynamic>.from(
+        originalMessages.last as Map,
+      );
+      final conversationParticipants = List<String>.from(
+        canonicalConversation['participantIds'] as List,
+      );
+      final oldReadSequences = Map<String, int>.from(
+        canonicalConversation['readSequences'] as Map,
+      );
+      final originalConversation = <String, dynamic>{
+        ...canonicalConversation,
+        'messageCursor': 1,
+        'messageRevision': 1,
+        'lastMessageId': originalMessage['id'],
+        'lastSenderId': originalMessage['senderId'],
+        'lastMessagePreview': originalMessage['body'],
+        'readSequences': <String, int>{
+          for (final participantId in conversationParticipants)
+            participantId: oldReadSequences[participantId] == 1 ? 1 : 0,
+        },
+        'messages': <Map<String, dynamic>>[
+          <String, dynamic>{
+            ...originalMessage,
+            'conversationId': conversationId,
+            'sequence': 1,
+            'updateRevision': 1,
+          },
+        ],
+      };
+      final legacyUpdateId = 'legacy-update-broadcast';
+      final legacyUpdateConversation = <String, dynamic>{
+        ...canonicalConversation,
+        'id': legacyUpdateId,
+        'messageCursor': 1,
+        'messageRevision': 1,
+        'createdAt': legacyUpdateMessage['createdAt'],
+        'updatedAt': legacyUpdateMessage['createdAt'],
+        'lastMessageId': legacyUpdateMessage['id'],
+        'lastSenderId': legacyUpdateMessage['senderId'],
+        'lastMessagePreview': legacyUpdateMessage['body'],
+        'readSequences': <String, int>{
+          for (final participantId in conversationParticipants)
+            participantId: oldReadSequences[participantId] == 2 ? 1 : 0,
+        },
+        'messages': <Map<String, dynamic>>[
+          <String, dynamic>{
+            ...legacyUpdateMessage,
+            'conversationId': legacyUpdateId,
+            'sequence': 1,
+            'updateRevision': 1,
+          },
+        ],
+      };
+      persistedState['messageConversations'] = <Map<String, dynamic>>[
+        legacyUpdateConversation,
+        originalConversation,
+      ];
+      await stateFile.writeAsString(jsonEncode(persistedState));
+
+      final migratedStore = await PiwibusStore.openWithPersistence(
+        JsonFileStatePersistence(stateFile),
+      );
+      addTearDown(migratedStore.close);
+      final migratedConversation = migratedStore
+          .messageConversationsForSession('active-recipient-session')
+          .single;
+      expect(migratedConversation['id'], conversationId);
+      expect(migratedConversation['unreadCount'], 2);
+      expect(
+        migratedStore
+            .conversationMessages('active-recipient-session', conversationId)
+            .map((item) => item['body']),
+        <String>[
+          'Information pour tous.',
+          'télécharger la nouvelle version en cliquant sur ce message',
+        ],
+      );
+      final concurrentFollowUps = await Future.wait(<Future<JsonMap>>[
+        migratedStore.sendBroadcastMessage(
+          'broadcast-admin-session',
+          <String, dynamic>{'body': 'Prochaine information A'},
+        ),
+        migratedStore.sendBroadcastMessage(
+          'broadcast-admin-session',
+          <String, dynamic>{'body': 'Prochaine information B'},
+        ),
+      ]);
+      expect(
+        concurrentFollowUps.map(
+          (result) => (result['conversation'] as Map<String, dynamic>)['id'],
+        ),
+        everyElement(conversationId),
+      );
+      expect(
+        concurrentFollowUps
+            .map(
+              (result) =>
+                  (result['message'] as Map<String, dynamic>)['sequence'],
+            )
+            .toSet(),
+        <int>{3, 4},
+      );
+      expect(
+        migratedStore
+            .conversationMessages('active-recipient-session', conversationId)
+            .map((message) => message['sequence']),
+        <int>[1, 2, 3, 4],
+      );
+
       await expectLater(
         store.sendMessageItem(
           'active-recipient-session',
