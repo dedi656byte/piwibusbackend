@@ -89,6 +89,11 @@ void main() {
       'email': 'manual-stop-observer@example.com',
       'password': 'password123',
     });
+    await store.register('manual-stop-unselected-session', <String, dynamic>{
+      'fullName': 'Unselected User',
+      'email': 'manual-stop-unselected@example.com',
+      'password': 'password123',
+    });
     final line = store.lines().first;
     const tripId = 'trip-manual-stop-reason';
     await store.startTrip('manual-stop-owner-session', <String, dynamic>{
@@ -110,11 +115,15 @@ void main() {
 
     final observerSnapshot = store.snapshot('manual-stop-observer-session');
     final stoppedTrip = _tripFromSnapshot(observerSnapshot, tripId);
+    expect(stoppedTrip['status'], 'termine');
     expect(stoppedTrip['lastSystemMessage'], expectedReason);
     final stopActivity = (observerSnapshot['activity'] as List)
         .whereType<Map>()
         .firstWhere((value) => value['title'] == 'Trajet arrêté');
     expect(stopActivity['subtitle'], expectedReason);
+
+    final unselectedSnapshot = store.snapshot('manual-stop-unselected-session');
+    expect(_tripFromSnapshot(unselectedSnapshot, tripId)['status'], 'termine');
   });
 }
 
