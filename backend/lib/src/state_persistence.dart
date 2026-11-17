@@ -165,6 +165,33 @@ class JsonFileStatePersistence extends StatePersistence {
   }
 }
 
+Future<T> runPostgresTransactionWithDeadlockRetry<T>(
+  Future<T> Function() transaction,
+) async {
+  const maxRetries = 3;
+  var retries = 0;
+  while (true) {
+    try {
+      return await transaction();
+    } on ServerException catch (error) {
+      if (error.code != '40P01' || retries >= maxRetries) rethrow;
+
+      retries += 1;
+      final retryDelay = Duration(milliseconds: 100 * retries);
+      const OpsLogger().warning(
+        'PostgreSQL state transaction deadlocked; retrying',
+        <String, Object?>{
+          'sqlState': error.code,
+          'retry': retries,
+          'maxRetries': maxRetries,
+          'retryDelayMs': retryDelay.inMilliseconds,
+        },
+      );
+      await Future<void>.delayed(retryDelay);
+    }
+  }
+}
+
 class PostgresStatePersistence extends StatePersistence {
   PostgresStatePersistence._({
     required Pool<dynamic> connection,
@@ -932,8 +959,8 @@ class PostgresStatePersistence extends StatePersistence {
     return () async {
       await previousOperation;
       try {
-        final revision = await _withConnectionRetry(
-          (connection) => connection.runTx(action),
+        final revision = await runPostgresTransactionWithDeadlockRetry(
+          () => _withConnectionRetry((connection) => connection.runTx(action)),
         );
         _loadedRevision = revision;
         onSuccess();
@@ -944,7 +971,6 @@ class PostgresStatePersistence extends StatePersistence {
           'severity': error.severity.name,
           if (error.schemaName != null) 'schema': error.schemaName,
           if (error.tableName != null) 'table': error.tableName,
-          if (error.columnName != null) 'column': error.columnName,
           if (error.constraintName != null) 'constraint': error.constraintName,
         });
         rethrow;
