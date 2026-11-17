@@ -166,6 +166,7 @@ class PiwibusStore {
   static const Duration _passwordResetCodeLifetime = Duration(minutes: 15);
   static const int _passwordResetMaxAttempts = 5;
   static const int _maxNameLength = 120;
+  static const Duration _databaseProbeCacheDuration = Duration(seconds: 1);
   static const int _maxEmailLength = 254;
   static const int _maxPhoneLength = 32;
   static const int _maxPasswordLength = 256;
@@ -193,6 +194,11 @@ class PiwibusStore {
   final int _revisionEpoch = DateTime.now().microsecondsSinceEpoch;
   Future<void> Function()? _publishSharedChange;
   StreamSubscription<void>? _externalChangeSubscription;
+  DateTime? _lastSuccessfulReadinessCheckAt;
+  Future<void>? _readinessCheckInFlight;
+  DateTime? _lastSuccessfulExternalRevisionCheckAt;
+  Future<bool>? _externalRevisionCheckInFlight;
+  Future<bool>? _forcedExternalRefreshInFlight;
   Future<void> _messageSendOperations = Future<void>.value();
   int _activePersistenceWrites = 0;
   bool _externalReloadPending = false;
@@ -207,7 +213,25 @@ class PiwibusStore {
   String get storageBackend => _persistence.name;
   bool get isDatabaseBacked => _persistence.isDatabaseBacked;
   bool get supportsGeospatialQueries => _persistence.supportsGeospatialQueries;
-  Future<void> checkReady() => _persistence.checkReady();
+  Future<void> checkReady() async {
+    if (_isWithinDatabaseProbeCache(_lastSuccessfulReadinessCheckAt)) return;
+    final pendingCheck = _readinessCheckInFlight;
+    if (pendingCheck != null) {
+      await pendingCheck;
+      return;
+    }
+
+    final check = _persistence.checkReady();
+    _readinessCheckInFlight = check;
+    try {
+      await check;
+      _lastSuccessfulReadinessCheckAt = DateTime.now();
+    } finally {
+      if (identical(_readinessCheckInFlight, check)) {
+        _readinessCheckInFlight = null;
+      }
+    }
+  }
 
   void setSessionOnline(String sessionId) {
     _setSessionOnline(sessionId, true);
@@ -293,9 +317,72 @@ class PiwibusStore {
       _externalReloadPending = true;
       return;
     }
-    if (await _persistence.hasExternalChanges()) {
-      await _reloadStateFromPersistence();
-      _notifySharedChange(committed: true);
+    await _refreshExternalState(force: true, notify: true);
+  }
+
+  bool _isWithinDatabaseProbeCache(DateTime? checkedAt) {
+    if (checkedAt == null) return false;
+    final elapsed = DateTime.now().difference(checkedAt);
+    return !elapsed.isNegative && elapsed < _databaseProbeCacheDuration;
+  }
+
+  Future<bool> _refreshExternalState({
+    bool force = false,
+    bool notify = false,
+  }) async {
+    if (!force) {
+      final forcedRefresh = _forcedExternalRefreshInFlight;
+      if (forcedRefresh != null) {
+        return forcedRefresh;
+      }
+      if (_isWithinDatabaseProbeCache(_lastSuccessfulExternalRevisionCheckAt)) {
+        return false;
+      }
+    }
+
+    final pendingRefresh = force
+        ? _forcedExternalRefreshInFlight
+        : _externalRevisionCheckInFlight;
+    if (pendingRefresh != null) {
+      return pendingRefresh;
+    }
+
+    if (force) {
+      final pendingCheck = _externalRevisionCheckInFlight;
+      if (pendingCheck != null) {
+        final changedDuringPendingCheck = await pendingCheck;
+        final changedAfterPendingCheck = await _refreshExternalState(
+          force: true,
+        );
+        final changed = changedDuringPendingCheck || changedAfterPendingCheck;
+        if (notify && changed) _notifySharedChange(committed: true);
+        return changed;
+      }
+    }
+
+    final refresh = () async {
+      final changed = await _persistence.hasExternalChanges();
+      if (changed) {
+        await _reloadStateFromPersistence();
+        if (notify) _notifySharedChange(committed: true);
+      }
+      _lastSuccessfulExternalRevisionCheckAt = DateTime.now();
+      return changed;
+    }();
+    if (force) {
+      _forcedExternalRefreshInFlight = refresh;
+    } else {
+      _externalRevisionCheckInFlight = refresh;
+    }
+
+    try {
+      return await refresh;
+    } finally {
+      if (force && identical(_forcedExternalRefreshInFlight, refresh)) {
+        _forcedExternalRefreshInFlight = null;
+      } else if (!force && identical(_externalRevisionCheckInFlight, refresh)) {
+        _externalRevisionCheckInFlight = null;
+      }
     }
   }
 
@@ -729,9 +816,7 @@ class PiwibusStore {
   }
 
   Future<String> ensureSession(String? sessionId) async {
-    if (await _persistence.hasExternalChanges()) {
-      await _reloadStateFromPersistence();
-    }
+    await _refreshExternalState();
     final candidate = sessionId?.trim() ?? '';
     String effectiveSessionId;
     final sessions = _sessions();
@@ -7906,9 +7991,7 @@ class PiwibusStore {
       _activePersistenceWrites -= 1;
       if (_activePersistenceWrites == 0 && _externalReloadPending) {
         _externalReloadPending = false;
-        if (await _persistence.hasExternalChanges()) {
-          await _reloadStateFromPersistence();
-        }
+        await _refreshExternalState(force: true);
         _notifySharedChange(committed: true);
       }
     }
