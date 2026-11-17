@@ -6,6 +6,81 @@ import 'package:test/test.dart';
 
 void main() {
   group('Store startup persistence', () {
+    test('keeps the bootstrap admin hash stable between startups', () async {
+      final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 0);
+      const environment = <String, String>{
+        'PIWIBUS_ADMIN_EMAIL': 'bootstrap@example.test',
+        'PIWIBUS_ADMIN_PASSWORD': 'bootstrap-password-123',
+      };
+
+      final firstStore = await PiwibusStore.openWithPersistence(
+        persistence,
+        bootstrapAdminEnvironment: environment,
+      );
+      final firstAdmin = (persistence.persistedState['users'] as List)
+          .cast<Map<String, dynamic>>()
+          .single;
+      final firstHash = firstAdmin['passwordHash'];
+      firstAdmin.addAll(<String, dynamic>{
+        'nameChangedAt': null,
+        'googleSubject': '',
+        'passwordResetHash': '',
+        'passwordResetRequestedAt': null,
+        'passwordResetExpiresAt': null,
+        'passwordResetAttempts': 0,
+        'activityReadAt': null,
+      });
+      firstAdmin.remove('isSuperAdmin');
+      (persistence.persistedState['sessions']
+          as Map)['admin-session'] = <String, dynamic>{
+        'currentUser': <String, dynamic>{
+          'id': firstAdmin['id'],
+          'primaryRole': 'administrateur',
+          'status': 'actif',
+        },
+        'activeRole': 'administrateur',
+        'section': 'accueil',
+        'isOnline': false,
+        'searchQuery': '',
+        'selectedLineCode': null,
+        'selectedTripId': null,
+        'favoriteLineCodes': <String>[],
+        'currentLocation': null,
+        'createdAt': '2026-01-01T00:00:00.000Z',
+        'lastSeenAt': '2026-01-01T00:00:00.000Z',
+      };
+      await firstStore.close();
+
+      final databaseStateBeforeSecondStart =
+          jsonDecode(jsonEncode(persistence.persistedState))
+              as Map<String, dynamic>;
+      final secondStore = await PiwibusStore.openWithPersistence(
+        persistence,
+        bootstrapAdminEnvironment: environment,
+      );
+      addTearDown(secondStore.close);
+
+      final secondAdmin = (persistence.persistedState['users'] as List)
+          .cast<Map<String, dynamic>>()
+          .single;
+      expect(secondAdmin['passwordHash'], firstHash);
+      final secondPersistedAdmin = Map<String, dynamic>.from(secondAdmin)
+        ..remove('isSuperAdmin');
+      expect(secondPersistedAdmin, equals(firstAdmin));
+      expect(persistence.persistedState, equals(databaseStateBeforeSecondStart));
+      expect(persistence.saveCount, 1);
+    });
+
+    test('does not rewrite an already normalized database state', () async {
+      final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 0);
+
+      final store = await PiwibusStore.openWithPersistence(persistence);
+      addTearDown(store.close);
+
+      expect(persistence.loadCount, 1);
+      expect(persistence.saveCount, 0);
+    });
+
     test('publishes shared changes after persistence succeeds', () async {
       final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 0);
       final store = await PiwibusStore.openWithPersistence(persistence);
@@ -55,6 +130,7 @@ void main() {
 
     test('reloads and retries after a concurrent database mutation', () async {
       final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 1);
+      persistence.persistedState = _nonCanonicalState();
       final store = await PiwibusStore.openWithPersistence(persistence);
       addTearDown(store.close);
 
@@ -68,16 +144,34 @@ void main() {
       );
     });
 
-    test('fails safely after three startup retries are exhausted', () async {
+    test('recovers after a burst of concurrent database mutations', () async {
       final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 4);
+      persistence.persistedState = _nonCanonicalState();
+
+      final store = await PiwibusStore.openWithPersistence(persistence);
+      addTearDown(store.close);
+
+      expect(persistence.loadCount, 5);
+      expect(persistence.saveCount, 5);
+      expect(
+        (persistence.persistedState['activity'] as List)
+            .cast<Map<String, dynamic>>()
+            .single['id'],
+        'concurrent-activity',
+      );
+    });
+
+    test('fails safely when startup retry budget is exhausted', () async {
+      final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 6);
+      persistence.persistedState = _nonCanonicalState();
 
       await expectLater(
         PiwibusStore.openWithPersistence(persistence),
         throwsA(isA<StateError>()),
       );
 
-      expect(persistence.loadCount, 4);
-      expect(persistence.saveCount, 4);
+      expect(persistence.loadCount, 6);
+      expect(persistence.saveCount, 6);
       expect(
         (persistence.persistedState['activity'] as List)
             .cast<Map<String, dynamic>>()
@@ -87,6 +181,18 @@ void main() {
     });
   });
 }
+
+Map<String, dynamic> _nonCanonicalState() => <String, dynamic>{
+  'sessions': <String, dynamic>{
+    'startup-session': <String, dynamic>{'activeRole': 'invalid'},
+  },
+  'users': <dynamic>[],
+  'trips': <dynamic>[],
+  'reports': <dynamic>[],
+  'pushTokens': <dynamic>[],
+  'activity': <dynamic>[],
+  'messageConversations': <dynamic>[],
+};
 
 class _ConcurrentMutationPersistence extends StatePersistence {
   _ConcurrentMutationPersistence({required this.conflictsRemaining});

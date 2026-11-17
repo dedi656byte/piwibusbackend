@@ -128,15 +128,18 @@ class PiwibusStore {
     required String lineDataVersion,
     required List<_NearbyPlaceLabel> nearbyPlaceLabels,
     required StatePersistence persistence,
+    required Map<String, String> bootstrapAdminEnvironment,
   }) : _lines = lines,
        _lineDataVersion = lineDataVersion,
        _nearbyPlaceLabels = nearbyPlaceLabels,
-       _persistence = persistence;
+       _persistence = persistence,
+       _bootstrapAdminEnvironment = bootstrapAdminEnvironment;
 
   final List<JsonMap> _lines;
   final String _lineDataVersion;
   final List<_NearbyPlaceLabel> _nearbyPlaceLabels;
   final StatePersistence _persistence;
+  final Map<String, String> _bootstrapAdminEnvironment;
   // Authenticated sessions are intentionally persistent: the user remains
   // connected until an explicit logout. These limits only clean up anonymous
   // sessions that never became attached to an account.
@@ -363,14 +366,16 @@ class PiwibusStore {
       lineDataVersion: catalog.lineDataVersion,
       nearbyPlaceLabels: nearbyPlaceLabels,
       persistence: persistence,
+      bootstrapAdminEnvironment: Platform.environment,
     );
     await store._loadOrSeedState(seedStateFile);
     return store;
   }
 
   static Future<PiwibusStore> openWithPersistence(
-    StatePersistence persistence,
-  ) async {
+    StatePersistence persistence, {
+    Map<String, String>? bootstrapAdminEnvironment,
+  }) async {
     final backendDir = _findBackendDirectory();
     final workspaceRoot = backendDir.parent;
     final csvFile = _findCsvFile(workspaceRoot, backendDir);
@@ -386,6 +391,8 @@ class PiwibusStore {
       lineDataVersion: catalog.lineDataVersion,
       nearbyPlaceLabels: nearbyPlaceLabels,
       persistence: persistence,
+      bootstrapAdminEnvironment:
+          bootstrapAdminEnvironment ?? Platform.environment,
     );
     await store._loadOrSeedState(seedStateFile);
     return store;
@@ -558,6 +565,7 @@ class PiwibusStore {
   Future<void> _loadOrSeedState(File seedStateFile) async {
     final persisted = await _persistence.loadState();
     if (persisted != null) {
+      const maxConflictRetries = 5;
       var conflictRetries = 0;
       try {
         var stateToNormalize = persisted;
@@ -566,12 +574,17 @@ class PiwibusStore {
           _ensureBootstrapAdminFromEnv();
           _enforceNoDefaultAdminPassword();
           if (_needsReseed(_state)) break;
+          if (_persistence.isDatabaseBacked &&
+              _persistedStateValuesEqual(_state, stateToNormalize)) {
+            return;
+          }
 
           try {
             await _saveState();
             return;
           } on ConcurrentStateMutationException {
-            if (!_persistence.isDatabaseBacked || conflictRetries >= 3) {
+            if (!_persistence.isDatabaseBacked ||
+                conflictRetries >= maxConflictRetries) {
               rethrow;
             }
             conflictRetries += 1;
@@ -627,6 +640,67 @@ class PiwibusStore {
     _ensureBootstrapAdminFromEnv();
     _enforceNoDefaultAdminPassword();
     await _saveState();
+  }
+
+  bool _persistedStateValuesEqual(
+    Object? left,
+    Object? right, {
+    String? fieldName,
+    bool activityEntry = false,
+  }) {
+    if (fieldName == 'currentUser') {
+      if (left == null || right == null) return left == null && right == null;
+      if (left is Map && right is Map) return left['id'] == right['id'];
+      return left == right;
+    }
+    if (identical(left, right)) return true;
+    if (left is Map && right is Map) {
+      for (final entry in left.entries) {
+        final key = entry.key;
+        if (_isNonPersistedStateField(key) || (activityEntry && key == 'id')) {
+          continue;
+        }
+        if (!right.containsKey(key) ||
+            !_persistedStateValuesEqual(
+              entry.value,
+              right[key],
+              fieldName: key is String ? key : null,
+              activityEntry: fieldName == 'activity',
+            )) {
+          return false;
+        }
+      }
+      return left.keys.every((key) {
+        if (_isNonPersistedStateField(key) || (activityEntry && key == 'id')) {
+          return true;
+        }
+        return right.containsKey(key);
+      });
+    }
+    if (left is List && right is List) {
+      if (left.length != right.length) return false;
+      for (var index = 0; index < left.length; index += 1) {
+        if (!_persistedStateValuesEqual(
+          left[index],
+          right[index],
+          fieldName: fieldName,
+          activityEntry: fieldName == 'activity',
+        )) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return left == right;
+  }
+
+  bool _isNonPersistedStateField(Object? field) {
+    return field == 'isOnline' ||
+        field == 'isSuperAdmin' ||
+        field == 'traveledDistanceMeters' ||
+        field == 'ratedByActorIds' ||
+        field == 'ratingScoresByActorId' ||
+        field == 'broadcastSenderId';
   }
 
   Future<void> _reloadStateFromPersistence() async {
@@ -5099,12 +5173,15 @@ class PiwibusStore {
     };
   }
 
-  JsonMap? _bootstrapAdminFromEnv(DateTime now) {
-    final email = (Platform.environment['PIWIBUS_ADMIN_EMAIL'] ?? '')
+  JsonMap? _bootstrapAdminFromEnv(
+    DateTime now, {
+    bool includePasswordHash = true,
+  }) {
+    final email = (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_EMAIL'] ?? '')
         .trim()
         .toLowerCase();
-    final password = (Platform.environment['PIWIBUS_ADMIN_PASSWORD'] ?? '')
-        .trim();
+    final password =
+        (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_PASSWORD'] ?? '').trim();
     if (email.isEmpty && password.isEmpty) {
       return null;
     }
@@ -5121,10 +5198,11 @@ class PiwibusStore {
       );
     }
     final fullName =
-        (Platform.environment['PIWIBUS_ADMIN_NAME'] ?? '').trim().isEmpty
+        (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_NAME'] ?? '').trim().isEmpty
         ? 'Administrateur Piwibus'
-        : (Platform.environment['PIWIBUS_ADMIN_NAME'] ?? '').trim();
-    final phone = (Platform.environment['PIWIBUS_ADMIN_PHONE'] ?? '').trim();
+        : (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_NAME'] ?? '').trim();
+    final phone = (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_PHONE'] ?? '')
+        .trim();
     final nowIso = now.toIso8601String();
     return _user(
       id: _newEntityId('admin'),
@@ -5134,22 +5212,28 @@ class PiwibusStore {
       role: 'administrateur',
       status: 'actif',
       isSuperAdmin: true,
-      passwordHash: _hashPassword(email, password),
+      passwordHash: includePasswordHash ? _hashPassword(email, password) : '',
       createdAt: nowIso,
       lastSeenAt: nowIso,
     );
   }
 
   bool _ensureBootstrapAdminFromEnv() {
-    final admin = _bootstrapAdminFromEnv(DateTime.now());
+    final admin = _bootstrapAdminFromEnv(
+      DateTime.now(),
+      includePasswordHash: false,
+    );
     if (admin == null) return false;
 
     final users = _users();
     final adminEmail = _text(admin['email']).toLowerCase();
+    final configuredPassword =
+        (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_PASSWORD'] ?? '').trim();
     final index = users.indexWhere(
       (user) => _text(user['email']).toLowerCase() == adminEmail,
     );
     if (index < 0) {
+      admin['passwordHash'] = _hashPassword(adminEmail, configuredPassword);
       users.insert(0, admin);
       _state['users'] = users;
       return true;
@@ -5161,7 +5245,13 @@ class PiwibusStore {
     existing['primaryRole'] = 'administrateur';
     existing['status'] = 'actif';
     existing['isSuperAdmin'] = true;
-    existing['passwordHash'] = _text(admin['passwordHash']);
+    if (!_verifyPassword(
+      adminEmail,
+      configuredPassword,
+      _text(existing['passwordHash']),
+    )) {
+      existing['passwordHash'] = _hashPassword(adminEmail, configuredPassword);
+    }
     if (fullName.isNotEmpty) existing['fullName'] = fullName;
     if (phone.isNotEmpty) existing['phone'] = phone;
     if (_text(existing['createdAt']).isEmpty) {
@@ -5178,7 +5268,7 @@ class PiwibusStore {
       if (!_isKnownDefaultAdminPassword(user)) continue;
       final email = _text(user['email']).toLowerCase();
       final replacementPassword =
-          (Platform.environment['PIWIBUS_ADMIN_PASSWORD'] ?? '').trim();
+          (_bootstrapAdminEnvironment['PIWIBUS_ADMIN_PASSWORD'] ?? '').trim();
       if (replacementPassword.length < 12) {
         throw StateError(
           'Le compte administrateur "$email" utilise encore un mot de passe '
