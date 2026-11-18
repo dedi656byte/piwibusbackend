@@ -9,6 +9,7 @@ import 'package:bcrypt/bcrypt.dart';
 import 'package:path/path.dart' as p;
 
 import 'google_id_token_verifier.dart';
+import 'ops_logger.dart';
 import 'route_proximity.dart';
 import 'state_persistence.dart';
 
@@ -652,7 +653,7 @@ class PiwibusStore {
   Future<void> _loadOrSeedState(File seedStateFile) async {
     final persisted = await _persistence.loadState();
     if (persisted != null) {
-      const maxConflictRetries = 5;
+      const maxConflictRetries = 10;
       var conflictRetries = 0;
       try {
         var stateToNormalize = persisted;
@@ -670,14 +671,29 @@ class PiwibusStore {
             await _saveState();
             return;
           } on ConcurrentStateMutationException {
-            if (!_persistence.isDatabaseBacked ||
-                conflictRetries >= maxConflictRetries) {
+            if (!_persistence.isDatabaseBacked) {
               rethrow;
             }
-            conflictRetries += 1;
-            await Future<void>.delayed(
-              Duration(milliseconds: 100 * conflictRetries),
+            final retryAttempt = conflictRetries + 1;
+            final willRetry = conflictRetries < maxConflictRetries;
+            final retryDelay = willRetry
+                ? Duration(
+                    milliseconds: 100 * math.min(retryAttempt, 5).toInt(),
+                  )
+                : Duration.zero;
+            const OpsLogger().warning(
+              'postgres_startup_normalization_conflict',
+              <String, Object?>{
+                'conflictAttempt': retryAttempt,
+                'retriesUsed': conflictRetries,
+                'maxRetries': maxConflictRetries,
+                'willRetry': willRetry,
+                if (willRetry) 'retryDelayMs': retryDelay.inMilliseconds,
+              },
             );
+            if (!willRetry) rethrow;
+            conflictRetries = retryAttempt;
+            await Future<void>.delayed(retryDelay);
             final latestState = await _persistence.loadState();
             if (latestState == null) {
               throw StateError(

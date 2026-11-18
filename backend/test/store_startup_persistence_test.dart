@@ -207,8 +207,27 @@ void main() {
       );
     });
 
-    test('fails safely when startup retry budget is exhausted', () async {
+    test('recovers after sustained concurrent database mutations', () async {
       final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 6);
+      persistence.persistedState = _nonCanonicalState();
+
+      final store = await PiwibusStore.openWithPersistence(persistence);
+      addTearDown(store.close);
+
+      expect(persistence.loadCount, 7);
+      expect(persistence.saveCount, 7);
+      expect(
+        (persistence.persistedState['activity'] as List)
+            .cast<Map<String, dynamic>>()
+            .single['id'],
+        'concurrent-activity',
+      );
+    });
+
+    test('fails safely when startup retry budget is exhausted', () async {
+      final persistence = _ConcurrentMutationPersistence(
+        conflictsRemaining: 11,
+      );
       persistence.persistedState = _nonCanonicalState();
 
       await expectLater(
@@ -216,8 +235,8 @@ void main() {
         throwsA(isA<StateError>()),
       );
 
-      expect(persistence.loadCount, 6);
-      expect(persistence.saveCount, 6);
+      expect(persistence.loadCount, 11);
+      expect(persistence.saveCount, 11);
       expect(
         (persistence.persistedState['activity'] as List)
             .cast<Map<String, dynamic>>()
