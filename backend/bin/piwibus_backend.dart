@@ -483,10 +483,10 @@ Future<void> main(List<String> args) async {
   router.get('/snapshot', (Request request) async {
     final sessionId = await sessionIdFor(request);
     final revision = store.sharedRevision;
-    final snapshot = store.snapshot(sessionId);
     final clientSnapshotRevision = _clientSnapshotRevision(request);
     final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
-    final includeLines = _includeLines(request, snapshot);
+    final includeLines = _includeLines(request, store.lineMetadata());
+    final snapshot = store.snapshot(sessionId, includeLines: includeLines);
 
     if (clientSnapshotRevision == revision &&
         clientSnapshotRevisionEpoch == store.revisionEpoch &&
@@ -501,11 +501,7 @@ Future<void> main(List<String> args) async {
     // partie du curseur de delta et changent rarement.
     if (!includeLines) {
       final scope = store.realtimeScope(sessionId);
-      final snapshotForDelta = _snapshotForRequest(
-        request,
-        store.snapshot(sessionId, includeLines: false),
-        jwtCodec,
-      );
+      final snapshotForDelta = _snapshotForRequest(request, snapshot, jwtCodec);
       final currentCursor = _RealtimeSnapshotCursor.fromSnapshot(
         snapshotForDelta,
         scope,
