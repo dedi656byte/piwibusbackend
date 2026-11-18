@@ -28,6 +28,7 @@ import '../lib/src/store.dart';
 
 const Duration _realtimeSnapshotDebounce = Duration(milliseconds: 100);
 const Duration _realtimeKeepAliveInterval = Duration(seconds: 30);
+const Duration _slowTimingLogThreshold = Duration(seconds: 1);
 const double _realtimeRelevanceRadiusMeters = 2500;
 const Duration _adminJwtTtl = Duration(hours: 8);
 const int _adminSessionMaxAgeSeconds = 8 * 60 * 60;
@@ -229,6 +230,7 @@ Future<void> main(List<String> args) async {
 
   router.get('/health', (Request request) => _text('ok'));
   router.get('/ready', (Request request) async {
+    final stopwatch = Stopwatch()..start();
     try {
       await store.checkReady();
       await redis?.checkReady();
@@ -236,6 +238,9 @@ Future<void> main(List<String> args) async {
     } catch (error, stackTrace) {
       logger.error('readiness_check_failed', const {}, error, stackTrace);
       return publicReadinessResponse(ready: false);
+    } finally {
+      stopwatch.stop();
+      _logSlowRequestPhase(request, 'readiness_check', stopwatch);
     }
   });
   router.get('/metrics', (Request request) {
@@ -481,49 +486,64 @@ Future<void> main(List<String> args) async {
     }
   });
   router.get('/snapshot', (Request request) async {
-    final sessionId = await sessionIdFor(request);
-    final revision = store.sharedRevision;
-    final clientSnapshotRevision = _clientSnapshotRevision(request);
-    final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
-    final includeLines = _includeLines(request, store.lineMetadata());
-    final snapshot = store.snapshot(sessionId, includeLines: includeLines);
+    final stopwatch = Stopwatch()..start();
+    try {
+      final sessionId = await sessionIdFor(request);
+      final revision = store.sharedRevision;
+      final clientSnapshotRevision = _clientSnapshotRevision(request);
+      final clientSnapshotRevisionEpoch = _clientSnapshotRevisionEpoch(request);
+      final includeLines = _includeLines(request, store.lineMetadata());
+      final snapshotStopwatch = Stopwatch()..start();
+      final snapshot = store.snapshot(sessionId, includeLines: includeLines);
+      snapshotStopwatch.stop();
+      _logSlowRequestPhase(request, 'snapshot_build', snapshotStopwatch);
 
-    if (clientSnapshotRevision == revision &&
-        clientSnapshotRevisionEpoch == store.revisionEpoch &&
-        !includeLines) {
-      return _json(_emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch));
-    }
-
-    // Comme pour le WebSocket/SSE, on essaie de renvoyer un delta plutot que
-    // le snapshot complet aux clients qui utilisent ce polling REST de
-    // secours (fallback quand le temps reel n'est pas disponible). On ne le
-    // fait que lorsque les lignes ne sont pas demandees : elles ne font pas
-    // partie du curseur de delta et changent rarement.
-    if (!includeLines) {
-      final scope = store.realtimeScope(sessionId);
-      final snapshotForDelta = _snapshotForRequest(request, snapshot, jwtCodec);
-      final currentCursor = _RealtimeSnapshotCursor.fromSnapshot(
-        snapshotForDelta,
-        scope,
-      );
-      final previousCursor = snapshotPollCursors[sessionId];
-      snapshotPollCursors[sessionId] = currentCursor;
-      if (previousCursor != null) {
-        final envelope = _realtimeDeltaEnvelope(
-          previous: previousCursor,
-          current: currentCursor,
-          currentActivity: snapshotForDelta['activity'],
-          revision: revision,
-          revisionEpoch: store.revisionEpoch,
-        );
+      if (clientSnapshotRevision == revision &&
+          clientSnapshotRevisionEpoch == store.revisionEpoch &&
+          !includeLines) {
         return _json(
-          envelope ??
-              _emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch),
+          _emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch),
         );
       }
-    }
 
-    return _json(_snapshotForRequest(request, snapshot, jwtCodec));
+      // Comme pour le WebSocket/SSE, on essaie de renvoyer un delta plutot que
+      // le snapshot complet aux clients qui utilisent ce polling REST de
+      // secours (fallback quand le temps reel n'est pas disponible). On ne le
+      // fait que lorsque les lignes ne sont pas demandees : elles ne font pas
+      // partie du curseur de delta et changent rarement.
+      if (!includeLines) {
+        final scope = store.realtimeScope(sessionId);
+        final snapshotForDelta = _snapshotForRequest(
+          request,
+          snapshot,
+          jwtCodec,
+        );
+        final currentCursor = _RealtimeSnapshotCursor.fromSnapshot(
+          snapshotForDelta,
+          scope,
+        );
+        final previousCursor = snapshotPollCursors[sessionId];
+        snapshotPollCursors[sessionId] = currentCursor;
+        if (previousCursor != null) {
+          final envelope = _realtimeDeltaEnvelope(
+            previous: previousCursor,
+            current: currentCursor,
+            currentActivity: snapshotForDelta['activity'],
+            revision: revision,
+            revisionEpoch: store.revisionEpoch,
+          );
+          return _json(
+            envelope ??
+                _emptyRealtimeDeltaEnvelope(revision, store.revisionEpoch),
+          );
+        }
+      }
+
+      return _json(_snapshotForRequest(request, snapshot, jwtCodec));
+    } finally {
+      stopwatch.stop();
+      _logSlowRequestPhase(request, 'snapshot_response', stopwatch);
+    }
   });
   router.get('/events', (Request request) async {
     final sessionId = await sessionIdFor(request);
@@ -1392,9 +1412,20 @@ Future<Response> _handleJson(
 }) async {
   try {
     final requestBody = body ?? await _readJson(request);
-    return _json(
-      _snapshotForRequest(request, await action(requestBody), jwtCodec),
+    final actionStopwatch = Stopwatch()..start();
+    final actionResult = await action(requestBody);
+    actionStopwatch.stop();
+    _logSlowRequestPhase(request, 'handler_action', actionStopwatch);
+
+    final responsePreparationStopwatch = Stopwatch()..start();
+    final responseBody = _snapshotForRequest(request, actionResult, jwtCodec);
+    responsePreparationStopwatch.stop();
+    _logSlowRequestPhase(
+      request,
+      'response_preparation',
+      responsePreparationStopwatch,
     );
+    return _json(responseBody);
   } catch (error) {
     if (error is ConcurrentStateMutationException) {
       return _errorForException(error);
@@ -1514,14 +1545,48 @@ Response _json(
   int statusCode = 200,
   Map<String, String>? headers,
 }) {
+  final encodedBody = _encodeJsonResponse(
+    body,
+    transport: 'http',
+    statusCode: statusCode,
+  );
   return Response(
     statusCode,
-    body: jsonEncode(body),
+    body: encodedBody,
     headers: <String, String>{
       HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
       if (headers != null) ...headers,
     },
   );
+}
+
+String _encodeJsonResponse(
+  Object body, {
+  required String transport,
+  int? statusCode,
+}) {
+  final serializationStopwatch = Stopwatch()..start();
+  final encodedBody = jsonEncode(body);
+  serializationStopwatch.stop();
+  if (serializationStopwatch.elapsed >= _slowTimingLogThreshold) {
+    const OpsLogger().warning('response_serialization_slow', {
+      'durationMs': serializationStopwatch.elapsedMicroseconds / 1000,
+      'transport': transport,
+      'responseType': body.runtimeType.toString(),
+      if (statusCode != null) 'statusCode': statusCode,
+    });
+  }
+  return encodedBody;
+}
+
+void _logSlowRequestPhase(Request request, String phase, Stopwatch stopwatch) {
+  if (stopwatch.elapsed < _slowTimingLogThreshold) return;
+  const OpsLogger().warning('http_request_phase_slow', {
+    'phase': phase,
+    'method': request.method,
+    'path': '/${request.url.path}',
+    'durationMs': stopwatch.elapsedMicroseconds / 1000,
+  });
 }
 
 Response _text(String body, {int statusCode = 200}) {
@@ -2216,7 +2281,8 @@ Stream<List<int>> _snapshotEventStream(
         store.revisionEpoch,
       );
       addText('event: ${envelope['type']}\n');
-      addText('data: ${jsonEncode(envelope)}\n\n');
+      final encodedEnvelope = _encodeJsonResponse(envelope, transport: 'sse');
+      addText('data: $encodedEnvelope\n\n');
       return;
     }
     final previousCursor = lastSnapshot;
@@ -2236,7 +2302,8 @@ Stream<List<int>> _snapshotEventStream(
     lastSnapshot = currentCursor;
     if (envelope == null) return;
     addText('event: ${envelope['type']}\n');
-    addText('data: ${jsonEncode(envelope)}\n\n');
+    final encodedEnvelope = _encodeJsonResponse(envelope, transport: 'sse');
+    addText('data: $encodedEnvelope\n\n');
   }
 
   void scheduleSnapshot() {
@@ -2317,7 +2384,8 @@ Stream<List<int>> _adminEventStream(
       metrics: metrics.snapshot(),
     );
     addText('event: dashboard\n');
-    addText('data: ${jsonEncode(payload)}\n\n');
+    final encodedPayload = _encodeJsonResponse(payload, transport: 'sse');
+    addText('data: $encodedPayload\n\n');
   }
 
   void scheduleDashboard() {
@@ -2403,7 +2471,7 @@ void _handleSnapshotWebSocket(
 
   void send(Object payload) {
     if (closed) return;
-    channel.sink.add(jsonEncode(payload));
+    channel.sink.add(_encodeJsonResponse(payload, transport: 'websocket'));
   }
 
   void sendSnapshot() {
@@ -2530,7 +2598,7 @@ void _handleAdminWebSocket(
 
   void send(Object payload) {
     if (closed) return;
-    channel.sink.add(jsonEncode(payload));
+    channel.sink.add(_encodeJsonResponse(payload, transport: 'websocket'));
   }
 
   void sendDashboard() {

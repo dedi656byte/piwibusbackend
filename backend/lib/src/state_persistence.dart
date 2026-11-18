@@ -222,6 +222,7 @@ class PostgresStatePersistence extends StatePersistence {
 
   static const String _stateId = 'default';
   static const int _defaultMaxConnectionCount = 10;
+  static const Duration _slowOperationLogThreshold = Duration(seconds: 1);
 
   @override
   String get name =>
@@ -235,13 +236,24 @@ class PostgresStatePersistence extends StatePersistence {
 
   @override
   Future<void> checkReady() async {
-    await _withConnectionRetry((connection) async {
-      final result = await connection.execute('SELECT pg_is_in_recovery()');
-      final inRecovery = result.isNotEmpty && result.first[0] == true;
-      if (inRecovery) {
-        throw StateError('Postgres is still in recovery mode.');
+    final stopwatch = Stopwatch()..start();
+    try {
+      await _withConnectionRetry((connection) async {
+        final result = await connection.execute('SELECT pg_is_in_recovery()');
+        final inRecovery = result.isNotEmpty && result.first[0] == true;
+        if (inRecovery) {
+          throw StateError('Postgres is still in recovery mode.');
+        }
+      });
+    } finally {
+      stopwatch.stop();
+      if (stopwatch.elapsed >= _slowOperationLogThreshold) {
+        const OpsLogger().warning('postgres_readiness_probe_slow', {
+          'probe': 'pg_is_in_recovery',
+          'durationMs': stopwatch.elapsedMicroseconds / 1000,
+        });
       }
-    });
+    }
   }
 
   @override
@@ -740,21 +752,28 @@ class PostgresStatePersistence extends StatePersistence {
 
   @override
   Future<void> saveState(Map<String, dynamic> state) async {
-    await _withTransactionRetry((session) async {
-      await _lockStateRevision(session, expectedRevision: _loadedRevision);
-      await _syncUsers(session, _mapList(state['users']));
-      await _syncSessions(session, _sessionMap(state['sessions']));
-      await _syncTrips(session, _mapList(state['trips']));
-      await _syncReports(session, _mapList(state['reports']));
-      await _syncPushTokens(session, _mapList(state['pushTokens']));
-      await _syncActivity(session, _mapList(state['activity']));
-      await _syncMessageConversations(
-        session,
-        _mapList(state['messageConversations']),
-      );
-      await _syncTripLocations(session, state);
-      return _bumpRevisionAndNotify(session, expectedRevision: _loadedRevision);
-    }, onSuccess: () => _refreshFingerprintsFromState(state));
+    await _withTransactionRetry(
+      (session) async {
+        await _lockStateRevision(session, expectedRevision: _loadedRevision);
+        await _syncUsers(session, _mapList(state['users']));
+        await _syncSessions(session, _sessionMap(state['sessions']));
+        await _syncTrips(session, _mapList(state['trips']));
+        await _syncReports(session, _mapList(state['reports']));
+        await _syncPushTokens(session, _mapList(state['pushTokens']));
+        await _syncActivity(session, _mapList(state['activity']));
+        await _syncMessageConversations(
+          session,
+          _mapList(state['messageConversations']),
+        );
+        await _syncTripLocations(session, state);
+        return _bumpRevisionAndNotify(
+          session,
+          expectedRevision: _loadedRevision,
+        );
+      },
+      operation: 'save_state',
+      onSuccess: () => _refreshFingerprintsFromState(state),
+    );
   }
 
   @override
@@ -763,39 +782,55 @@ class PostgresStatePersistence extends StatePersistence {
     required StateMutationBatch batch,
   }) async {
     if (batch.isEmpty) return;
-    await _withTransactionRetry((session) async {
-      await _lockStateRevision(session, expectedRevision: _loadedRevision);
-      if (batch.users) {
-        await _syncUsers(session, _mapList(state['users']));
-      }
-      if (batch.sessions) {
-        await _syncSessions(session, _sessionMap(state['sessions']));
-      }
-      if (batch.trips) {
-        await _syncTrips(session, _mapList(state['trips']));
-        await _syncTripLocations(session, state);
-      }
-      if (batch.reports) {
-        await _syncReports(session, _mapList(state['reports']));
-      }
-      if (batch.pushTokens) {
-        await _syncPushTokens(session, _mapList(state['pushTokens']));
-      }
-      if (batch.activity) {
-        await _syncActivity(session, _mapList(state['activity']));
-      }
-      if (batch.messageConversations) {
-        await _syncMessageConversations(
+    await _withTransactionRetry(
+      (session) async {
+        await _lockStateRevision(session, expectedRevision: _loadedRevision);
+        if (batch.users) {
+          await _syncUsers(session, _mapList(state['users']));
+        }
+        if (batch.sessions) {
+          await _syncSessions(session, _sessionMap(state['sessions']));
+        }
+        if (batch.trips) {
+          await _syncTrips(session, _mapList(state['trips']));
+          await _syncTripLocations(session, state);
+        }
+        if (batch.reports) {
+          await _syncReports(session, _mapList(state['reports']));
+        }
+        if (batch.pushTokens) {
+          await _syncPushTokens(session, _mapList(state['pushTokens']));
+        }
+        if (batch.activity) {
+          await _syncActivity(session, _mapList(state['activity']));
+        }
+        if (batch.messageConversations) {
+          await _syncMessageConversations(
+            session,
+            _mapList(state['messageConversations']),
+          );
+        }
+        return _bumpRevisionAndNotify(
           session,
-          _mapList(state['messageConversations']),
+          expectedRevision: _loadedRevision,
+          outboxEvents: batch.outboxEvents,
         );
-      }
-      return _bumpRevisionAndNotify(
-        session,
-        expectedRevision: _loadedRevision,
-        outboxEvents: batch.outboxEvents,
-      );
-    }, onSuccess: () => _refreshFingerprintsFromState(state, batch: batch));
+      },
+      operation: 'apply_mutations',
+      diagnostics: <String, Object?>{
+        'mutationTypes': <String>[
+          if (batch.users) 'users',
+          if (batch.sessions) 'sessions',
+          if (batch.trips) 'trips',
+          if (batch.reports) 'reports',
+          if (batch.pushTokens) 'push_tokens',
+          if (batch.activity) 'activity',
+          if (batch.messageConversations) 'message_conversations',
+          if (batch.outboxEvents.isNotEmpty) 'outbox_events',
+        ],
+      },
+      onSuccess: () => _refreshFingerprintsFromState(state, batch: batch),
+    );
   }
 
   @override
@@ -958,6 +993,8 @@ class PostgresStatePersistence extends StatePersistence {
 
   Future<int> _withTransactionRetry(
     Future<int> Function(TxSession session) action, {
+    required String operation,
+    Map<String, Object?> diagnostics = const <String, Object?>{},
     required void Function() onSuccess,
   }) {
     if (_closed) {
@@ -967,11 +1004,15 @@ class PostgresStatePersistence extends StatePersistence {
     final operationFinished = Completer<void>();
     _transactionOperations = operationFinished.future;
     return () async {
+      final queueStopwatch = Stopwatch()..start();
       await previousOperation;
+      queueStopwatch.stop();
+      final transactionStopwatch = Stopwatch()..start();
       try {
         final revision = await runPostgresTransactionWithDeadlockRetry(
           () => _withConnectionRetry((connection) => connection.runTx(action)),
         );
+        transactionStopwatch.stop();
         _loadedRevision = revision;
         onSuccess();
         return revision;
@@ -985,7 +1026,20 @@ class PostgresStatePersistence extends StatePersistence {
         });
         rethrow;
       } finally {
-        operationFinished.complete();
+        transactionStopwatch.stop();
+        try {
+          if (queueStopwatch.elapsed >= _slowOperationLogThreshold ||
+              transactionStopwatch.elapsed >= _slowOperationLogThreshold) {
+            const OpsLogger().warning('postgres_state_transaction_slow', {
+              'operation': operation,
+              'queueWaitMs': queueStopwatch.elapsedMicroseconds / 1000,
+              'transactionMs': transactionStopwatch.elapsedMicroseconds / 1000,
+              ...diagnostics,
+            });
+          }
+        } finally {
+          operationFinished.complete();
+        }
       }
     }();
   }
