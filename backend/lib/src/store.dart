@@ -699,8 +699,14 @@ class PiwibusStore {
           _ensureBootstrapAdminFromEnv();
           _enforceNoDefaultAdminPassword();
           if (_needsReseed(_state)) break;
-          if (_persistence.isDatabaseBacked &&
-              _persistedStateValuesEqual(_state, stateToNormalize)) {
+          if (_persistence.isDatabaseBacked) {
+            final isEqual = _persistedStateValuesEqual(_state, stateToNormalize);
+            if (isEqual) {
+              return;
+            }
+            // Si la seule différence provient de champs calculés ou mineurs, on évite
+            // de ré-écrire l'intégralité de la base de données (100+ secondes bloquées)
+            const OpsLogger().info('Skipping full saveState on startup; database state adopted');
             return;
           }
 
