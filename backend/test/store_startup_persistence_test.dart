@@ -67,7 +67,10 @@ void main() {
       final secondPersistedAdmin = Map<String, dynamic>.from(secondAdmin)
         ..remove('isSuperAdmin');
       expect(secondPersistedAdmin, equals(firstAdmin));
-      expect(persistence.persistedState, equals(databaseStateBeforeSecondStart));
+      expect(
+        persistence.persistedState,
+        equals(databaseStateBeforeSecondStart),
+      );
       expect(persistence.saveCount, 1);
     });
 
@@ -127,6 +130,49 @@ void main() {
 
       expect(localChanges, 0);
     });
+
+    test(
+      'retries session touch after a concurrent database mutation',
+      () async {
+        final persistence = _ConcurrentMutationPersistence(
+          conflictsRemaining: 0,
+        );
+        final firstStore = await PiwibusStore.openWithPersistence(persistence);
+        final sessionId = await firstStore.ensureSession(null);
+        await firstStore.register(sessionId, <String, dynamic>{
+          'fullName': 'Events User',
+          'email': 'events-user@example.test',
+          'password': 'events-user-password-123',
+        });
+        await firstStore.close();
+
+        final sessions =
+            persistence.persistedState['sessions'] as Map<String, dynamic>;
+        final session = Map<String, dynamic>.from(sessions[sessionId] as Map)
+          ..['lastSeenAt'] = DateTime.utc(2020).toIso8601String();
+        sessions[sessionId] = session;
+        final store = await PiwibusStore.openWithPersistence(persistence);
+        addTearDown(store.close);
+        persistence.conflictsRemaining = 1;
+
+        expect(await store.ensureSession(sessionId), sessionId);
+        expect(persistence.conflictsRemaining, 0);
+        expect(
+          (persistence.persistedState['activity'] as List)
+              .cast<Map<String, dynamic>>()
+              .single['id'],
+          'concurrent-activity',
+        );
+        final persistedSession =
+            (persistence.persistedState['sessions']
+                    as Map<String, dynamic>)[sessionId]
+                as Map<String, dynamic>;
+        expect(
+          DateTime.parse(persistedSession['lastSeenAt'] as String),
+          isNot(DateTime.utc(2020)),
+        );
+      },
+    );
 
     test('reloads and retries after a concurrent database mutation', () async {
       final persistence = _ConcurrentMutationPersistence(conflictsRemaining: 1);

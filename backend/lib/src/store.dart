@@ -818,49 +818,57 @@ class PiwibusStore {
   Future<String> ensureSession(String? sessionId) async {
     await _refreshExternalState();
     final candidate = sessionId?.trim() ?? '';
-    String effectiveSessionId;
-    final sessions = _sessions();
-    var changed = _pruneExpiredSessions(sessions);
-    if (candidate.isEmpty) {
-      effectiveSessionId = _newSessionId();
-      sessions[effectiveSessionId] = _defaultSessionState();
-      changed = true;
-    } else {
-      final existing = sessions[candidate];
-      if (existing == null) {
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt += 1) {
+      String effectiveSessionId;
+      final sessions = _sessions();
+      var changed = _pruneExpiredSessions(sessions);
+      if (candidate.isEmpty) {
         effectiveSessionId = _newSessionId();
         sessions[effectiveSessionId] = _defaultSessionState();
         changed = true;
       } else {
-        final normalized = _normalizeSession(existing);
-        if (_sessionIsExpired(normalized)) {
-          sessions.remove(candidate);
-          _state['sessions'] = sessions;
+        final existing = sessions[candidate];
+        if (existing == null) {
           effectiveSessionId = _newSessionId();
           sessions[effectiveSessionId] = _defaultSessionState();
           changed = true;
-        } else if (_sessionNeedsRotation(candidate, normalized)) {
-          sessions.remove(candidate);
-          effectiveSessionId = _newSessionId();
-          normalized['lastSeenAt'] = _nowIso();
-          sessions[effectiveSessionId] = normalized;
-          _state['sessions'] = sessions;
-          changed = true;
         } else {
-          effectiveSessionId = candidate;
-          if (_sessionNeedsTouch(normalized)) {
-            normalized['lastSeenAt'] = _nowIso();
-            sessions[candidate] = normalized;
+          final normalized = _normalizeSession(existing);
+          if (_sessionIsExpired(normalized)) {
+            sessions.remove(candidate);
+            effectiveSessionId = _newSessionId();
+            sessions[effectiveSessionId] = _defaultSessionState();
             changed = true;
+          } else if (_sessionNeedsRotation(candidate, normalized)) {
+            sessions.remove(candidate);
+            effectiveSessionId = _newSessionId();
+            normalized['lastSeenAt'] = _nowIso();
+            sessions[effectiveSessionId] = normalized;
+            changed = true;
+          } else {
+            effectiveSessionId = candidate;
+            if (_sessionNeedsTouch(normalized)) {
+              normalized['lastSeenAt'] = _nowIso();
+              sessions[candidate] = normalized;
+              changed = true;
+            }
           }
         }
       }
+
+      _state['sessions'] = sessions;
+      if (!changed) return effectiveSessionId;
+
+      try {
+        await _persist(const StateMutationBatch(sessions: true));
+        return effectiveSessionId;
+      } on ConcurrentStateMutationException {
+        if (attempt + 1 == maxAttempts) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 100 * (attempt + 1)));
+      }
     }
-    _state['sessions'] = sessions;
-    if (changed) {
-      await _persist(const StateMutationBatch(sessions: true));
-    }
-    return effectiveSessionId;
+    throw const ConcurrentStateMutationException();
   }
 
   JsonMap snapshot(String sessionId, {bool includeLines = true}) {
