@@ -81,7 +81,113 @@ void main() {
         expect(store.sharedRevision, greaterThan(revisionBeforeRefresh));
       },
     );
+
+    test('waits for external refreshes before closing persistence', () async {
+      final persistence = _BlockingRefreshPersistence();
+      final store = await PiwibusStore.openWithPersistence(
+        persistence,
+        bootstrapAdminEnvironment: const <String, String>{},
+      );
+      final refresh = store.refreshFromPersistence();
+      await persistence.refreshStarted.future;
+
+      final close = store.close();
+      await Future<void>.delayed(Duration.zero);
+      final closedWhileRefreshing = persistence.closed;
+
+      persistence.releaseRefresh.complete();
+      await expectLater(refresh, completes);
+      await close;
+
+      expect(closedWhileRefreshing, isFalse);
+      expect(persistence.closed, isTrue);
+    });
+
+    test(
+      'waits for deferred external reloads after writes before closing',
+      () async {
+        final persistence = _BlockingMutationPersistence();
+        final store = await PiwibusStore.openWithPersistence(
+          persistence,
+          bootstrapAdminEnvironment: const <String, String>{},
+        );
+        final session = store.ensureSession('close-race-session');
+        await persistence.mutationStarted.future;
+
+        persistence.externalChanges = true;
+        await store.refreshFromPersistence();
+        final close = store.close();
+        await Future<void>.delayed(Duration.zero);
+        final closedWhileWriting = persistence.closed;
+
+        persistence.releaseMutation.complete();
+        await expectLater(session, completes);
+        await close;
+
+        expect(closedWhileWriting, isFalse);
+        expect(persistence.closed, isTrue);
+      },
+    );
   });
+}
+
+class _BlockingRefreshPersistence extends _ProbeCountingPersistence {
+  final Completer<void> refreshStarted = Completer<void>();
+  final Completer<void> releaseRefresh = Completer<void>();
+  bool closed = false;
+
+  @override
+  Future<bool> hasExternalChanges() async {
+    refreshStarted.complete();
+    await releaseRefresh.future;
+    return true;
+  }
+
+  @override
+  Future<Map<String, dynamic>?> loadState() {
+    if (closed) {
+      throw StateError('Persistence was closed before refresh completed.');
+    }
+    return super.loadState();
+  }
+
+  @override
+  Future<void> close() async {
+    closed = true;
+  }
+}
+
+class _BlockingMutationPersistence extends _ProbeCountingPersistence {
+  final Completer<void> mutationStarted = Completer<void>();
+  final Completer<void> releaseMutation = Completer<void>();
+  bool closed = false;
+  bool _blockNextMutation = true;
+
+  @override
+  Future<void> applyMutations({
+    required Map<String, dynamic> state,
+    required StateMutationBatch batch,
+  }) async {
+    if (_blockNextMutation) {
+      _blockNextMutation = false;
+      mutationStarted.complete();
+      await releaseMutation.future;
+    }
+    await super.applyMutations(state: state, batch: batch);
+  }
+
+  @override
+  Future<Map<String, dynamic>?> loadState() {
+    if (closed) {
+      throw StateError('Persistence was closed before write completed.');
+    }
+    return super.loadState();
+  }
+
+  @override
+  Future<void> close() async {
+    closed = true;
+  }
 }
 
 class _ProbeCountingPersistence extends StatePersistence {

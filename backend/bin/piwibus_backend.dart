@@ -132,6 +132,14 @@ Future<void> main(List<String> args) async {
     );
     presenceChangeSubscription = redis.remotePresenceChanges.listen(
       (_) => unawaited(syncRedisPresence()),
+      onError: (Object error, StackTrace stackTrace) {
+        logger.error(
+          'Redis presence change stream failed',
+          const {},
+          error,
+          stackTrace,
+        );
+      },
     );
   } else if (redis != null) {
     store.attachChangePublisher(redis.publishChange);
@@ -1383,14 +1391,19 @@ Future<void> main(List<String> args) async {
     externalChangeReconcileTimer?.cancel();
     presenceSyncTimer?.cancel();
     await presenceChangeSubscription?.cancel();
+    try {
+      await server.close(force: false).timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      logger.warning('Graceful HTTP shutdown timed out; closing connections');
+      await server.close(force: true);
+    }
     await pushOutboxWorker?.close();
     await redisOutboxRelay?.close();
-    await server.close(force: false);
     pushNotifications.close();
     mapTileClient.close();
     await googleIdTokenVerifier.close();
-    await redis?.close();
     await store.close();
+    await redis?.close();
     logger.info('Piwibus backend stopped');
   }
 

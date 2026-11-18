@@ -203,6 +203,10 @@ class PiwibusStore {
   Future<void> _messageSendOperations = Future<void>.value();
   int _activePersistenceWrites = 0;
   bool _externalReloadPending = false;
+  bool _closing = false;
+  int _activeExternalRefreshes = 0;
+  Completer<void>? _externalRefreshesDrained;
+  Completer<void>? _persistenceWritesDrained;
 
   JsonMap _state = <String, dynamic>{};
   final Map<String, int> _sessionConnectionCounts = <String, int>{};
@@ -308,17 +312,50 @@ class PiwibusStore {
 
   void listenToExternalChanges(Stream<void> changes) {
     _externalChangeSubscription?.cancel();
-    _externalChangeSubscription = changes.listen((_) async {
+    _externalChangeSubscription = changes.listen(
+      (_) {
+        unawaited(_refreshAfterExternalChange());
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        const OpsLogger().error(
+          'External state change stream failed',
+          const {},
+          error,
+          stackTrace,
+        );
+      },
+    );
+  }
+
+  Future<void> _refreshAfterExternalChange() async {
+    try {
       await refreshFromPersistence();
-    });
+    } catch (error, stackTrace) {
+      const OpsLogger().error(
+        'External state refresh failed',
+        const {},
+        error,
+        stackTrace,
+      );
+    }
   }
 
   Future<void> refreshFromPersistence() async {
-    if (_activePersistenceWrites > 0) {
-      _externalReloadPending = true;
-      return;
+    if (_closing) return;
+    _activeExternalRefreshes += 1;
+    try {
+      if (_activePersistenceWrites > 0) {
+        _externalReloadPending = true;
+        return;
+      }
+      await _refreshExternalState(force: true, notify: true);
+    } finally {
+      _activeExternalRefreshes -= 1;
+      if (_activeExternalRefreshes == 0) {
+        _externalRefreshesDrained?.complete();
+        _externalRefreshesDrained = null;
+      }
     }
-    await _refreshExternalState(force: true, notify: true);
   }
 
   bool _isWithinDatabaseProbeCache(DateTime? checkedAt) {
@@ -8053,17 +8090,33 @@ class PiwibusStore {
       _notifySharedChange(committed: true);
       Error.throwWithStackTrace(error, stackTrace);
     } finally {
-      _activePersistenceWrites -= 1;
-      if (_activePersistenceWrites == 0 && _externalReloadPending) {
-        _externalReloadPending = false;
-        await _refreshExternalState(force: true);
-        _notifySharedChange(committed: true);
+      try {
+        if (_activePersistenceWrites == 1 && _externalReloadPending) {
+          _externalReloadPending = false;
+          await _refreshExternalState(force: true);
+          _notifySharedChange(committed: true);
+        }
+      } finally {
+        _activePersistenceWrites -= 1;
+        if (_activePersistenceWrites == 0) {
+          _persistenceWritesDrained?.complete();
+          _persistenceWritesDrained = null;
+        }
       }
     }
   }
 
   Future<void> close() async {
+    _closing = true;
     await _externalChangeSubscription?.cancel();
+    if (_activePersistenceWrites > 0) {
+      final drained = _persistenceWritesDrained ??= Completer<void>();
+      await drained.future;
+    }
+    if (_activeExternalRefreshes > 0) {
+      final drained = _externalRefreshesDrained ??= Completer<void>();
+      await drained.future;
+    }
     await _sharedChanges.close();
     await _persistence.close();
   }
