@@ -754,7 +754,7 @@ class PostgresStatePersistence extends StatePersistence {
   Future<void> saveState(Map<String, dynamic> state) async {
     await _withTransactionRetry(
       (session) async {
-        await _lockStateRevision(session, expectedRevision: _loadedRevision);
+        await _checkStateRevision(session, expectedRevision: _loadedRevision);
         await _syncUsers(session, _mapList(state['users']));
         await _syncSessions(session, _sessionMap(state['sessions']));
         await _syncTrips(session, _mapList(state['trips']));
@@ -784,7 +784,7 @@ class PostgresStatePersistence extends StatePersistence {
     if (batch.isEmpty) return;
     await _withTransactionRetry(
       (session) async {
-        await _lockStateRevision(session, expectedRevision: _loadedRevision);
+        await _checkStateRevision(session, expectedRevision: _loadedRevision);
         if (batch.users) {
           await _syncUsers(session, _mapList(state['users']));
         }
@@ -1779,17 +1779,12 @@ class PostgresStatePersistence extends StatePersistence {
     return revision;
   }
 
-  Future<void> _lockStateRevision(
+  Future<void> _checkStateRevision(
     TxSession session, {
     required int expectedRevision,
   }) async {
-    await session.execute(
-      Sql.named('SELECT pg_advisory_xact_lock(@lockClass, @lockObject)'),
-      parameters: const <String, Object?>{
-        'lockClass': 20567,
-        'lockObject': 18754,
-      },
-    );
+    // The final revision CAS protects the transaction; don't serialize all
+    // writers while their row mutations are running.
     final result = await session.execute(
       Sql.named('''
         SELECT revision
