@@ -824,6 +824,10 @@ class PostgresStatePersistence extends StatePersistence {
             ST_Distance(location, origin.point) AS distance_meters
           FROM piwibus_trip_locations, origin
           WHERE status = 'actif'
+            AND owner_id IS NOT NULL
+            AND btrim(owner_id) <> ''
+            AND lower(btrim(owner_id)) <> 'anonymous-owner'
+            AND lower(btrim(owner_id)) NOT LIKE 'session-%'
             AND location IS NOT NULL
             AND ST_DWithin(location, origin.point, @radius)
           ORDER BY location <-> origin.point
@@ -859,6 +863,10 @@ class PostgresStatePersistence extends StatePersistence {
           ) AS distance_meters
         FROM piwibus_trip_locations
         WHERE status = 'actif'
+          AND owner_id IS NOT NULL
+          AND btrim(owner_id) <> ''
+          AND lower(btrim(owner_id)) <> 'anonymous-owner'
+          AND lower(btrim(owner_id)) NOT LIKE 'session-%'
         ORDER BY distance_meters ASC
         LIMIT @limit
       '''),

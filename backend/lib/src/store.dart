@@ -871,7 +871,15 @@ class PiwibusStore {
         ? null
         : _refreshPublicUser(currentUser);
     final canViewAll = _sessionUserCanAdmin(session);
-    final allTrips = _tripsWithObserverCounts(_trips());
+    final allTrips = _tripsWithObserverCounts(
+      _trips()
+          .where(
+            (trip) =>
+                _text(trip['status']) != 'actif' ||
+                _hasAccountTripOwner(trip['owner_id']),
+          )
+          .toList(),
+    );
     final visibleTrips = allTrips
         .map(
           (trip) => _publicTripForSession(
@@ -1352,6 +1360,7 @@ class PiwibusStore {
         final tripId = _text(row['trip_id']);
         final trip = tripsById[tripId];
         if (trip == null) continue;
+        if (!_hasAccountTripOwner(trip['owner_id'])) continue;
         result.add(<String, dynamic>{
           ..._publicNearbyTrip(trip),
           'distanceMeters': _double(row['distance_meters']),
@@ -1363,6 +1372,7 @@ class PiwibusStore {
     final result = <JsonMap>[];
     for (final trip in _trips()) {
       if (_text(trip['status']) != 'actif') continue;
+      if (!_hasAccountTripOwner(trip['owner_id'])) continue;
       final liveLocation = trip['liveLocation'];
       if (liveLocation is! Map) continue;
       final tripLat = _double(liveLocation['lat'] ?? liveLocation['latitude']);
@@ -1423,6 +1433,10 @@ class PiwibusStore {
     final allTrips = _tripsWithObserverCounts(_trips());
     for (final trip in allTrips) {
       if (_text(trip['id']) != normalizedTripId) continue;
+      if (_text(trip['status']) == 'actif' &&
+          !_hasAccountTripOwner(trip['owner_id'])) {
+        return null;
+      }
       final public = _publicTripForSession(
         trip,
         sessionId,
@@ -1575,7 +1589,11 @@ class PiwibusStore {
         .where((entry) => seenWithin(entry.value, const Duration(minutes: 6)))
         .toList(growable: false);
     final activeTrips = trips
-        .where((trip) => _text(trip['status']) == 'actif')
+        .where(
+          (trip) =>
+              _text(trip['status']) == 'actif' &&
+              _hasAccountTripOwner(trip['owner_id']),
+        )
         .toList(growable: false);
     final offRouteTrips = activeTrips
         .where((trip) => _text(trip['offRouteSince']).isNotEmpty)
@@ -1849,7 +1867,14 @@ class PiwibusStore {
       },
       'liveTrips': activeTrips.map(_adminTrip).toList(growable: false),
       'liveUsers': liveUsers.toList(growable: false),
-      'trips': trips.map(_adminTrip).toList(growable: false),
+      'trips': trips
+          .where(
+            (trip) =>
+                _text(trip['status']) != 'actif' ||
+                _hasAccountTripOwner(trip['owner_id']),
+          )
+          .map(_adminTrip)
+          .toList(growable: false),
       'users': users
           .map((user) {
             final public = _publicUser(user);
@@ -4043,10 +4068,8 @@ class PiwibusStore {
     final now = _nowIso();
     final routeTitle = _routeTitle(line);
     final split = _routeSplit(routeTitle);
+    final ownerId = _requireTripOwnerId(sessionId);
     final owner = _currentUser(session);
-    final ownerId = _text(owner?['id']).isEmpty
-        ? 'session-$sessionId'
-        : _text(owner?['id']);
     final requestedTripId = _clientIdOrEmpty(
       body['tripId'],
       fieldName: 'Identifiant trajet',
@@ -6158,6 +6181,8 @@ class PiwibusStore {
       };
     }
     for (final trip in trips) {
+      final isActive = _text(trip['status']) == 'actif';
+      if (isActive && !_hasAccountTripOwner(trip['owner_id'])) continue;
       final code = _normalizeCode(trip['line_code'] ?? trip['lineCode']);
       final item = statsByCode[code] ??= <String, dynamic>{
         'lineCode': code,
@@ -6174,7 +6199,7 @@ class PiwibusStore {
       item['observers'] = _int(item['observers']) + _int(trip['observers']);
       item['distanceKm'] =
           _double(item['distanceKm']) + _tripTravelledDistanceKm(trip);
-      if (_text(trip['status']) == 'actif') {
+      if (isActive) {
         item['activeTrips'] = _int(item['activeTrips']) + 1;
       }
     }
@@ -7744,6 +7769,22 @@ class PiwibusStore {
       throw StateError('Authentification requise.');
     }
     return currentUserId;
+  }
+
+  String _requireTripOwnerId(String sessionId) {
+    final ownerId = _authenticatedUserId(sessionId);
+    if (!_hasAccountTripOwner(ownerId)) {
+      throw StateError('Un compte est requis pour créer un trajet live.');
+    }
+    return ownerId;
+  }
+
+  bool _hasAccountTripOwner(Object? value) {
+    final ownerId = _text(value).trim().toLowerCase();
+    return ownerId.isNotEmpty &&
+        ownerId != 'anonymous-owner' &&
+        ownerId != 'session-owner' &&
+        !ownerId.startsWith('session-');
   }
 
   bool _sessionUserCanAdmin(JsonMap session) =>

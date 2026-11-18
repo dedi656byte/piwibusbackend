@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -7,6 +8,90 @@ import 'package:piwibus_backend/src/store.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('requires an authenticated account to create a live trip', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'piwibus-trip-owner-required',
+    );
+    final persistence = JsonFileStatePersistence(
+      File(p.join(tempDir.path, 'state.json')),
+    );
+    final store = await PiwibusStore.openWithPersistence(persistence);
+    addTearDown(() async {
+      await store.close();
+      if (tempDir.existsSync()) {
+        await tempDir.delete(recursive: true);
+      }
+    });
+
+    final line = store.lines().first;
+    await expectLater(
+      store.startTrip('anonymous-trip-session', <String, dynamic>{
+        'tripId': 'anonymous-live-trip',
+        'lineCode': _text(line['code']),
+        'liveLocation': _routePointLocation(line),
+      }),
+      throwsStateError,
+    );
+
+    expect(store.snapshot('anonymous-trip-session')['trips'], isEmpty);
+    expect(
+      await store.nearbyTrips(lat: 5.34, lng: -4.01, radiusMeters: 50000),
+      isEmpty,
+    );
+  });
+
+  test(
+    'hides previously persisted active trips without account owners',
+    () async {
+      final persistence = _MemoryTripStatePersistence();
+      final store = await PiwibusStore.openWithPersistence(persistence);
+      var storeOpen = true;
+      addTearDown(() async {
+        if (storeOpen) await store.close();
+      });
+
+      await store.register('owner-filter-session', <String, dynamic>{
+        'fullName': 'Trip Owner',
+        'email': 'owner-filter@example.com',
+        'password': 'password123',
+      });
+      final line = store.lines().first;
+      await store.startTrip('owner-filter-session', <String, dynamic>{
+        'tripId': 'persisted-ownerless-trip',
+        'lineCode': _text(line['code']),
+        'liveLocation': _routePointLocation(line),
+      });
+
+      await store.close();
+      storeOpen = false;
+      final state = await persistence.loadState();
+      final trips = (state!['trips'] as List)
+          .map((trip) => Map<String, dynamic>.from(trip as Map))
+          .toList();
+      trips.single['owner_id'] = 'session-legacy-owner';
+      await persistence.saveState(<String, dynamic>{...state, 'trips': trips});
+
+      final reloadedStore = await PiwibusStore.openWithPersistence(persistence);
+      expect(reloadedStore.snapshot('owner-filter-session')['trips'], isEmpty);
+      expect(
+        reloadedStore.tripStatusForSession(
+          'owner-filter-session',
+          'persisted-ownerless-trip',
+        ),
+        isNull,
+      );
+      expect(
+        await reloadedStore.nearbyTrips(
+          lat: 5.34,
+          lng: -4.01,
+          radiusMeters: 50000,
+        ),
+        isEmpty,
+      );
+      await reloadedStore.close();
+    },
+  );
+
   test(
     'stopping a trip repeatedly is idempotent and remains owner-only',
     () async {
@@ -147,6 +232,26 @@ int _stopActivityCount(Map<String, dynamic> snapshot) {
       .whereType<Map>()
       .where((value) => value['title'] == 'Trajet arrêté')
       .length;
+}
+
+class _MemoryTripStatePersistence extends StatePersistence {
+  Map<String, dynamic>? _state;
+
+  @override
+  String get name => 'trip-owner-test';
+
+  @override
+  Future<Map<String, dynamic>?> loadState() async {
+    final state = _state;
+    return state == null
+        ? null
+        : Map<String, dynamic>.from(jsonDecode(jsonEncode(state)) as Map);
+  }
+
+  @override
+  Future<void> saveState(Map<String, dynamic> state) async {
+    _state = Map<String, dynamic>.from(jsonDecode(jsonEncode(state)) as Map);
+  }
 }
 
 String _stopActivityId(Map<String, dynamic> snapshot) {
