@@ -80,6 +80,7 @@ Future<void> main(List<String> args) async {
         .where((value) => value.isNotEmpty)
         .toSet(),
   );
+  unawaited(googleIdTokenVerifier.warmUp());
   if (redis != null) {
     store.listenToExternalChanges(redis.remoteChanges);
   }
@@ -709,9 +710,19 @@ Future<void> main(List<String> args) async {
       final snapshot = await store.signInWithGoogle(sessionId, identity);
       return _json(_snapshotForRequest(request, snapshot, jwtCodec));
     } on GoogleIdTokenVerificationException catch (error) {
-      final statusCode = googleIdTokenVerifier.isConfigured ? 401 : 503;
+      logger.warning('google_sign_in_failed', <String, Object?>{
+        'error': error.message,
+        'configured': googleIdTokenVerifier.isConfigured,
+      });
+      final isUnavailable = error.message.contains('temporairement indisponible') ||
+          !googleIdTokenVerifier.isConfigured;
+      final statusCode = isUnavailable ? 503 : 401;
       return _error(error.message, statusCode: statusCode);
-    } catch (error) {
+    } catch (error, stack) {
+      logger.error('google_sign_in_unexpected_error', <String, Object?>{
+        'error': error.toString(),
+        'stack': stack.toString(),
+      });
       return _errorForException(error);
     }
   });

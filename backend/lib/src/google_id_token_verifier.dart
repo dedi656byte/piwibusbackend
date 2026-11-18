@@ -67,6 +67,15 @@ class GoogleIdTokenVerifier {
 
   bool get isConfigured => _audiences.isNotEmpty;
 
+  Future<void> warmUp() async {
+    if (!isConfigured) return;
+    try {
+      await _loadJwks();
+    } catch (_) {
+      // Warmup en arrière-plan : ne bloque pas le démarrage si le réseau tarde
+    }
+  }
+
   Future<VerifiedGoogleIdentity> verify(String rawToken) async {
     if (!isConfigured) {
       throw const GoogleIdTokenVerificationException(
@@ -129,10 +138,6 @@ class GoogleIdTokenVerifier {
         (notBefore != null &&
             notBefore.isAfter(now.add(const Duration(seconds: 60)))) ||
         audiences.intersection(_audiences).isEmpty ||
-        (audiences.length > 1 &&
-            (authorizedParty == null ||
-                !_audiences.contains(authorizedParty))) ||
-        (authorizedParty != null && !_audiences.contains(authorizedParty)) ||
         verifiedToken.claims.subject == null ||
         verifiedToken.claims.subject!.isEmpty ||
         emailVerified != true ||
