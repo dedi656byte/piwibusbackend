@@ -128,7 +128,6 @@ class GoogleIdTokenVerifier {
     final expiry = claims.expiry?.toUtc();
     final notBefore = claims.notBefore?.toUtc();
     final audiences = claims.audience?.toSet() ?? const <String>{};
-    final authorizedParty = _stringClaim(claims['azp']);
     final email = (_stringClaim(claims['email']) ?? '').trim().toLowerCase();
     final emailVerified = claims['email_verified'];
 

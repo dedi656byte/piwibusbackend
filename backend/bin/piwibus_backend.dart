@@ -167,7 +167,8 @@ Future<void> main(List<String> args) async {
         ) ??
         180,
     redis: redis,
-    trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS'),
+    trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
+        Platform.environment.containsKey('RENDER'),
     onMemoryFallback: metrics.rateLimitMemoryFallback,
     pathLimitsPerMinute: const <String, int>{
       'auth/sign-in': 10,
@@ -683,10 +684,11 @@ Future<void> main(List<String> args) async {
   });
   router.post('/auth/google/sign-in', (Request request) async {
     try {
+      final trustProxy = _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
+          Platform.environment.containsKey('RENDER');
       if (productionConfig.isProduction &&
           request.requestedUri.scheme != 'https' &&
-          !(_envFlag('PIWIBUS_TRUST_PROXY_HEADERS') &&
-              _requestIsSecure(request))) {
+          !(trustProxy && _requestIsSecure(request))) {
         return _error(
           'La connexion Google exige une connexion HTTPS.',
           statusCode: 400,

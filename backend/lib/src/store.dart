@@ -2161,21 +2161,20 @@ class PiwibusStore {
       user = users[linkedIndex];
     } else if (emailIndex >= 0) {
       user = users[emailIndex];
-      final linkedSubject = _text(user['googleSubject']);
-      if (linkedSubject.isNotEmpty && linkedSubject != subject) {
-        throw StateError('Impossible de se connecter avec Google.');
-      }
       user['googleSubject'] = subject;
     } else {
       final suppliedName = identity.fullName?.trim() ?? '';
       final localPart = email.substring(0, email.indexOf('@'));
-      final fullName = _boundedText(
+      final baseName = _boundedText(
         suppliedName.isEmpty ? localPart : suppliedName,
         _maxNameLength,
         fieldName: 'Nom complet',
       );
-      if (fullName.isEmpty || _userNameExists(users, fullName)) {
-        throw StateError('Impossible de se connecter avec Google.');
+      var fullName = baseName.isEmpty ? localPart : baseName;
+      var suffix = 2;
+      while (_userNameExists(users, fullName)) {
+        fullName = '$baseName $suffix';
+        suffix++;
       }
       user = _user(
         id: _newEntityId('u'),
