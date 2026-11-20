@@ -4321,18 +4321,25 @@ class PiwibusStore {
         .whereType<StateOutboxEvent>()
         .toList(growable: false);
     _notifySharedChange();
-    await _persist(
-      StateMutationBatch(
-        users: starHistoryChanged,
-        trips: true,
-        sessions: true,
-        activity: true,
-        messageConversations: conversationChanged,
-        outboxEvents: <StateOutboxEvent>[
-          ...cancellationPushEvents,
-          if (startPushEvent != null) startPushEvent,
-        ],
-      ),
+    // Persistance asynchrone non-bloquante : le trajet est déjà validé et actif
+    // en mémoire. On répond immédiatement au client HTTP sans le faire attendre
+    // la transaction PostgreSQL (qui peut prendre plusieurs secondes sur Supabase).
+    unawaited(
+      _persist(
+        StateMutationBatch(
+          users: starHistoryChanged,
+          trips: true,
+          sessions: true,
+          activity: true,
+          messageConversations: conversationChanged,
+          outboxEvents: <StateOutboxEvent>[
+            ...cancellationPushEvents,
+            if (startPushEvent != null) startPushEvent,
+          ],
+        ),
+      ).catchError((Object error, StackTrace stackTrace) {
+        const OpsLogger().error('persist_start_trip_failed', {}, error, stackTrace);
+      }),
     );
     return _snapshotWithSystemTripCancellationNotices(
       sessionId,
@@ -4867,16 +4874,20 @@ class PiwibusStore {
       ),
     );
     _notifySharedChange();
-    await _persist(
-      StateMutationBatch(
-        users: starHistoryChanged,
-        trips: true,
-        sessions: true,
-        activity: true,
-        outboxEvents: <StateOutboxEvent>[
-          if (stopPushEvent != null) stopPushEvent,
-        ],
-      ),
+    unawaited(
+      _persist(
+        StateMutationBatch(
+          users: starHistoryChanged,
+          trips: true,
+          sessions: true,
+          activity: true,
+          outboxEvents: <StateOutboxEvent>[
+            if (stopPushEvent != null) stopPushEvent,
+          ],
+        ),
+      ).catchError((Object error, StackTrace stackTrace) {
+        const OpsLogger().error('persist_stop_trip_failed', {}, error, stackTrace);
+      }),
     );
     return snapshot(sessionId);
   }
@@ -8096,7 +8107,7 @@ class PiwibusStore {
       _sessionFlushTimer = null;
       if (_closing) return;
       // Fire-and-forget : on ignore les erreurs pour ne pas bloquer le caller.
-      _persist(const StateMutationBatch(sessions: true, users: true)).catchError((Object e) {
+      _persist(const StateMutationBatch(sessions: true)).catchError((Object e) {
         const OpsLogger().warning('session_flush_error', {'error': '$e'});
       });
     });
