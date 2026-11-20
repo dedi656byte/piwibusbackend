@@ -208,6 +208,12 @@ class PiwibusStore {
   Completer<void>? _externalRefreshesDrained;
   Completer<void>? _persistenceWritesDrained;
 
+  // Debounce des mises à jour de session non critiques (section, role, ligne…).
+  // On regroupe les écritures Postgres qui arrivent en rafale en une seule
+  // transaction déclenchée au plus tôt 4 s après la dernière modification.
+  Timer? _sessionFlushTimer;
+  static const Duration _sessionFlushDelay = Duration(seconds: 4);
+
   JsonMap _state = <String, dynamic>{};
   final Map<String, int> _sessionConnectionCounts = <String, int>{};
   final Map<String, bool> _sessionOnline = <String, bool>{};
@@ -3792,7 +3798,7 @@ class PiwibusStore {
     }
     session['activeRole'] = nextRole;
     _putSession(sessionId, session);
-    await _persist(const StateMutationBatch(sessions: true));
+    _scheduleSessionFlush(); // debounce : écriture différée 4 s
     return snapshot(sessionId);
   }
 
@@ -3867,7 +3873,7 @@ class PiwibusStore {
       sessionState['section'] = nextSection;
     }
     _putSession(sessionId, sessionState);
-    await _persist(const StateMutationBatch(sessions: true));
+    _scheduleSessionFlush(); // debounce : écriture différée 4 s
     return snapshot(sessionId);
   }
 
@@ -3879,7 +3885,7 @@ class PiwibusStore {
       fieldName: 'Recherche',
     );
     _putSession(sessionId, session);
-    await _persist(const StateMutationBatch(sessions: true));
+    _scheduleSessionFlush(); // debounce : écriture différée 4 s
     return snapshot(sessionId);
   }
 
@@ -3894,11 +3900,11 @@ class PiwibusStore {
       session['selectedLineCode'] = null;
       session['selectedTripId'] = null;
       _putSession(sessionId, session);
-      await _persist(const StateMutationBatch(sessions: true));
+      _scheduleSessionFlush(); // debounce : écriture différée 4 s
     } else if (lineByCode(requestedLineCode) != null) {
       session['selectedLineCode'] = _normalizeCode(requestedLineCode);
       _putSession(sessionId, session);
-      await _persist(const StateMutationBatch(sessions: true));
+      _scheduleSessionFlush(); // debounce : écriture différée 4 s
     }
     return snapshot(sessionId);
   }
@@ -8083,10 +8089,38 @@ class PiwibusStore {
     await _persistence.saveState(_state);
   }
 
+  /// Planifie une écriture Postgres différée pour les mises à jour de session
+  /// non critiques (section, rôle, ligne sélectionnée, recherche).
+  ///
+  /// Principe : au lieu d'écrire en Postgres à chaque appel HTTP (ce qui
+  /// bloquerait la file séquentielle et retarderait POST /trips), on attend
+  /// [_sessionFlushDelay] après la dernière modification avant de persister.
+  /// Si une écriture prioritaire (trips, users…) survient entre-temps, elle
+  /// embarquera ces changements de session dans le même batch grâce aux
+  /// fingerprints diff de [applyMutations].
+  void _scheduleSessionFlush() {
+    _sessionFlushTimer?.cancel();
+    _sessionFlushTimer = Timer(_sessionFlushDelay, () {
+      _sessionFlushTimer = null;
+      if (_closing) return;
+      // Fire-and-forget : on ignore les erreurs pour ne pas bloquer le caller.
+      _persist(const StateMutationBatch(sessions: true)).catchError((Object e) {
+        const OpsLogger().warning('session_flush_error', {'error': '$e'});
+      });
+    });
+  }
+
   Future<void> _persist(StateMutationBatch batch, {JsonMap? state}) async {
     _activePersistenceWrites += 1;
     try {
-      await _persistence.applyMutations(state: state ?? _state, batch: batch);
+      await _persistence.applyMutations(
+        state: state ?? _state,
+        batch: batch,
+        // Priorité haute pour les batches contenant des trajets : on s'insère
+        // en tête de file Postgres pour ne pas attendre les mises à jour de
+        // session en cours (section, rôle…).
+        priority: batch.trips,
+      );
       _notifySharedChange(committed: true);
       _publishCommittedChange();
     } on ConcurrentStateMutationException catch (error, stackTrace) {
@@ -8113,6 +8147,16 @@ class PiwibusStore {
 
   Future<void> close() async {
     _closing = true;
+    // Annule le timer de debounce et persiste immédiatement les sessions
+    // en attente pour ne pas perdre l'état lors d'un arrêt propre.
+    if (_sessionFlushTimer != null) {
+      _sessionFlushTimer!.cancel();
+      _sessionFlushTimer = null;
+      await _persist(const StateMutationBatch(sessions: true)).catchError(
+        (Object e) =>
+            const OpsLogger().warning('session_flush_on_close_error', {'error': '$e'}),
+      );
+    }
     await _externalChangeSubscription?.cancel();
     if (_activePersistenceWrites > 0) {
       final drained = _persistenceWritesDrained ??= Completer<void>();

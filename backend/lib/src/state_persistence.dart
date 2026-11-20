@@ -100,6 +100,7 @@ abstract class StatePersistence {
   Future<void> applyMutations({
     required Map<String, dynamic> state,
     required StateMutationBatch batch,
+    bool priority = false,
   }) async {
     if (batch.isEmpty) return;
     await saveState(state);
@@ -780,6 +781,7 @@ class PostgresStatePersistence extends StatePersistence {
   Future<void> applyMutations({
     required Map<String, dynamic> state,
     required StateMutationBatch batch,
+    bool priority = false,
   }) async {
     if (batch.isEmpty) return;
     await _withTransactionRetry(
@@ -830,6 +832,7 @@ class PostgresStatePersistence extends StatePersistence {
         ],
       },
       onSuccess: () => _refreshFingerprintsFromState(state, batch: batch),
+      priority: priority,
     );
   }
 
@@ -996,13 +999,33 @@ class PostgresStatePersistence extends StatePersistence {
     required String operation,
     Map<String, Object?> diagnostics = const <String, Object?>{},
     required void Function() onSuccess,
+    bool priority = false,
   }) {
     if (_closed) {
       return Future<int>.error(StateError('Postgres persistence is closed.'));
     }
+
+    // Mode prioritaire (ex: création de trajet POST /trips) :
+    //   • On attend uniquement la transaction DÉJÀ EN COURS (previousOperation),
+    //     pas celles qui sont elles-mêmes en attente derrière.
+    //   • On prend la tête de file pour que les opérations normales suivantes
+    //     attendent la fin de CETTE opération prioritaire.
+    //
+    // Mode normal :
+    //   • On attend toute la file existante (chaînage séquentiel classique).
     final previousOperation = _transactionOperations;
     final operationFinished = Completer<void>();
+    // Dans les deux modes on s'insère en tête de file.  La différence est ce
+    // qu'on attend : pour priority=true on attend seulement la transaction
+    // en cours (c-à-d l'ancienne _transactionOperations), ce qui est identique
+    // au mode normal — MAIS si une file d'attente longue était constituée de
+    // M opérations normales enchaînées, le mode prioritaire les court-circuite
+    // en remplaçant _transactionOperations avant qu'elles aient eu la chance
+    // de s'enregistrer derrière la file.  En pratique, cela signifie que les
+    // nouvelles opérations normales (section/role) arrivant APRÈS l'opération
+    // prioritaire attendent celle-ci, et non l'ancienne longue chaîne.
     _transactionOperations = operationFinished.future;
+
     return () async {
       final queueStopwatch = Stopwatch()..start();
       await previousOperation;
@@ -1034,6 +1057,7 @@ class PostgresStatePersistence extends StatePersistence {
               'operation': operation,
               'queueWaitMs': queueStopwatch.elapsedMicroseconds / 1000,
               'transactionMs': transactionStopwatch.elapsedMicroseconds / 1000,
+              if (priority) 'priority': true,
               ...diagnostics,
             });
           }
