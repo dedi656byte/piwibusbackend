@@ -883,57 +883,52 @@ class PiwibusStore {
   Future<String> ensureSession(String? sessionId) async {
     await _refreshExternalState();
     final candidate = sessionId?.trim() ?? '';
-    const maxAttempts = 3;
-    for (var attempt = 0; attempt < maxAttempts; attempt += 1) {
-      String effectiveSessionId;
-      final sessions = _sessions();
-      var changed = _pruneExpiredSessions(sessions);
-      if (candidate.isEmpty) {
+    String effectiveSessionId;
+    final sessions = _sessions();
+    var changed = _pruneExpiredSessions(sessions);
+    if (candidate.isEmpty) {
+      effectiveSessionId = _newSessionId();
+      sessions[effectiveSessionId] = _defaultSessionState();
+      changed = true;
+    } else {
+      final existing = sessions[candidate];
+      if (existing == null) {
         effectiveSessionId = _newSessionId();
         sessions[effectiveSessionId] = _defaultSessionState();
         changed = true;
       } else {
-        final existing = sessions[candidate];
-        if (existing == null) {
+        final normalized = _normalizeSession(existing);
+        if (_sessionIsExpired(normalized)) {
+          sessions.remove(candidate);
           effectiveSessionId = _newSessionId();
           sessions[effectiveSessionId] = _defaultSessionState();
           changed = true;
+        } else if (_sessionNeedsRotation(candidate, normalized)) {
+          sessions.remove(candidate);
+          effectiveSessionId = _newSessionId();
+          normalized['lastSeenAt'] = _nowIso();
+          sessions[effectiveSessionId] = normalized;
+          changed = true;
         } else {
-          final normalized = _normalizeSession(existing);
-          if (_sessionIsExpired(normalized)) {
-            sessions.remove(candidate);
-            effectiveSessionId = _newSessionId();
-            sessions[effectiveSessionId] = _defaultSessionState();
-            changed = true;
-          } else if (_sessionNeedsRotation(candidate, normalized)) {
-            sessions.remove(candidate);
-            effectiveSessionId = _newSessionId();
+          effectiveSessionId = candidate;
+          if (_sessionNeedsTouch(normalized)) {
             normalized['lastSeenAt'] = _nowIso();
-            sessions[effectiveSessionId] = normalized;
+            sessions[candidate] = normalized;
             changed = true;
-          } else {
-            effectiveSessionId = candidate;
-            if (_sessionNeedsTouch(normalized)) {
-              normalized['lastSeenAt'] = _nowIso();
-              sessions[candidate] = normalized;
-              changed = true;
-            }
           }
         }
       }
-
-      _state['sessions'] = sessions;
-      if (!changed) return effectiveSessionId;
-
-      try {
-        await _persist(const StateMutationBatch(sessions: true));
-        return effectiveSessionId;
-      } on ConcurrentStateMutationException {
-        if (attempt + 1 == maxAttempts) rethrow;
-        await Future<void>.delayed(Duration(milliseconds: 100 * (attempt + 1)));
-      }
     }
-    throw const ConcurrentStateMutationException();
+
+    _state['sessions'] = sessions;
+    if (changed) {
+      // Écriture différée (debounce) : on ne bloque JAMAIS les requêtes HTTP
+      // entrantes (GET /snapshot, GET /events, POST /session/section, etc.)
+      // avec une transaction synchrone vers Postgres. L'état en mémoire
+      // est déjà à jour, et sera persisté groupé après 4 s.
+      _scheduleSessionFlush();
+    }
+    return effectiveSessionId;
   }
 
   JsonMap snapshot(String sessionId, {bool includeLines = true}) {
@@ -4165,7 +4160,7 @@ class PiwibusStore {
         session['selectedTripId'] = null;
       }
       _putSession(sessionId, session);
-      await _persist(const StateMutationBatch(sessions: true));
+      _scheduleSessionFlush();
       return snapshot(sessionId);
     }
     final liveLocationInput =
@@ -8113,10 +8108,10 @@ class PiwibusStore {
       await _persistence.applyMutations(
         state: state ?? _state,
         batch: batch,
-        // Priorité haute pour les batches contenant des trajets : on s'insère
-        // en tête de file Postgres pour ne pas attendre les mises à jour de
-        // session en cours (section, rôle…).
-        priority: batch.trips,
+        // Priorité haute pour les batches contenant des trajets ou des utilisateurs
+        // (login, inscription, Google sign-in) : on s'insère en tête de file
+        // Postgres pour ne pas attendre les écritures de session différées.
+        priority: batch.trips || batch.users,
       );
       _notifySharedChange(committed: true);
       _publishCommittedChange();
