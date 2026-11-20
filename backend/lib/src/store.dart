@@ -3849,14 +3849,11 @@ class PiwibusStore {
 
     _putSession(sessionId, session);
     if (shouldPersist) {
-      await _persist(const StateMutationBatch(sessions: true, users: true));
-      // Ne notifier les abonnés temps réel / la révision partagée que pour les
-      // mises à jour de position jugées significatives (voir
-      // shouldPersistNearbyLocationUpdate). Cela évite qu'un simple bruit GPS
-      // ambiant, envoyé par chaque utilisateur en continu, ne casse le
-      // raccourci "rien n'a changé" du polling /snapshot et ne déclenche un
-      // recalcul + renvoi de delta temps réel à tous les clients connectés.
+      // On notifie immédiatement les clients temps réel (WebSocket/polling)
+      // mais on diffère l'écriture Postgres de 4 s via le debounce pour ne
+      // pas bloquer la file séquentielle — notamment POST /trips.
       _notifySharedChange();
+      _scheduleSessionFlush();
     }
     return includeSnapshot
         ? snapshot(sessionId)
@@ -3960,7 +3957,7 @@ class PiwibusStore {
     }
     session['favoriteLineCodes'] = favorites.toList();
     _putSession(sessionId, session);
-    await _persist(const StateMutationBatch(sessions: true));
+    _scheduleSessionFlush();
     return snapshot(sessionId);
   }
 
@@ -8104,7 +8101,7 @@ class PiwibusStore {
       _sessionFlushTimer = null;
       if (_closing) return;
       // Fire-and-forget : on ignore les erreurs pour ne pas bloquer le caller.
-      _persist(const StateMutationBatch(sessions: true)).catchError((Object e) {
+      _persist(const StateMutationBatch(sessions: true, users: true)).catchError((Object e) {
         const OpsLogger().warning('session_flush_error', {'error': '$e'});
       });
     });
