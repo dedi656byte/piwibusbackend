@@ -2099,14 +2099,18 @@ class PostgresStatePersistence extends StatePersistence {
 
   static String _withDefaultPoolSettings(String databaseUrl) {
     final uri = Uri.parse(databaseUrl);
-    final queryParameters = uri.queryParameters;
+    final queryParameters = Map<String, String>.from(uri.queryParameters);
+    // Le driver postgres de Dart ne supporte pas channel_binding (utilisé par Neon).
+    queryParameters.remove('channel_binding');
     final hasSslMode = queryParameters.keys.any(
       (key) => key.toLowerCase() == 'sslmode',
     );
     final hasMaxConnectionCount = queryParameters.containsKey(
       'max_connection_count',
     );
-    if (hasSslMode && hasMaxConnectionCount) return databaseUrl;
+    if (hasSslMode && hasMaxConnectionCount && !uri.queryParameters.containsKey('channel_binding')) {
+      return databaseUrl;
+    }
     return uri
         .replace(
           queryParameters: <String, String>{
