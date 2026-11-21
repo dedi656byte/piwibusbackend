@@ -167,7 +167,8 @@ Future<void> main(List<String> args) async {
         ) ??
         180,
     redis: redis,
-    trustProxyHeaders: _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
+    trustProxyHeaders:
+        _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
         Platform.environment.containsKey('RENDER'),
     onMemoryFallback: metrics.rateLimitMemoryFallback,
     pathLimitsPerMinute: const <String, int>{
@@ -684,7 +685,8 @@ Future<void> main(List<String> args) async {
   });
   router.post('/auth/google/sign-in', (Request request) async {
     try {
-      final trustProxy = _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
+      final trustProxy =
+          _envFlag('PIWIBUS_TRUST_PROXY_HEADERS') ||
           Platform.environment.containsKey('RENDER');
       if (productionConfig.isProduction &&
           request.requestedUri.scheme != 'https' &&
@@ -716,7 +718,8 @@ Future<void> main(List<String> args) async {
         'error': error.message,
         'configured': googleIdTokenVerifier.isConfigured,
       });
-      final isUnavailable = error.message.contains('temporairement indisponible') ||
+      final isUnavailable =
+          error.message.contains('temporairement indisponible') ||
           !googleIdTokenVerifier.isConfigured;
       final statusCode = isUnavailable ? 503 : 401;
       return _error(error.message, statusCode: statusCode);
@@ -1346,6 +1349,16 @@ Future<void> main(List<String> args) async {
       (body) =>
           store.updateReportStatus(sessionId, id, _string(body['status'])),
     );
+  });
+  router.post('/reports/<id>/reaction', (Request request, String id) async {
+    final sessionId = await sessionIdFor(request);
+    return _handleJson(request, jwtCodec, (body) {
+      final reaction = body['reaction'];
+      if (reaction != null && reaction != 'like' && reaction != 'dislike') {
+        throw const FormatException('Réaction invalide.');
+      }
+      return store.setReportReaction(sessionId, id, reaction as String?);
+    });
   });
   router.delete('/reports/<id>', (Request request, String id) async {
     final sessionId = await sessionIdFor(request);

@@ -706,13 +706,18 @@ class PiwibusStore {
           _enforceNoDefaultAdminPassword();
           if (_needsReseed(_state)) break;
           if (_persistence.isDatabaseBacked) {
-            final isEqual = _persistedStateValuesEqual(_state, stateToNormalize);
+            final isEqual = _persistedStateValuesEqual(
+              _state,
+              stateToNormalize,
+            );
             if (isEqual) {
               return;
             }
             // Si la seule différence provient de champs calculés ou mineurs, on évite
             // de ré-écrire l'intégralité de la base de données (100+ secondes bloquées)
-            const OpsLogger().info('Skipping full saveState on startup; database state adopted');
+            const OpsLogger().info(
+              'Skipping full saveState on startup; database state adopted',
+            );
             return;
           }
 
@@ -958,12 +963,16 @@ class PiwibusStore {
         )
         .toList(growable: false);
     final allReports = _reports();
-    final visibleReports = canViewAll
-        ? allReports
-        : allReports
-              .where((report) => _text(report['status']) != 'refuse')
-              .map(_publicReport)
-              .toList(growable: false);
+    final visibleReports = allReports
+        .where((report) => canViewAll || _text(report['status']) != 'refuse')
+        .map(
+          (report) => _publicReportForSession(
+            report,
+            sessionId: sessionId,
+            currentUser: currentUser,
+          ),
+        )
+        .toList(growable: false);
     final visibleActivity = _activityItems()
         .where((activity) => _activityVisibleToSession(activity, sessionId))
         .toList(growable: false);
@@ -1959,7 +1968,18 @@ class PiwibusStore {
             };
           })
           .toList(growable: false),
-      'reports': reports.map(_adminReport).toList(growable: false),
+      'reports': reports
+          .map(
+            (report) => <String, dynamic>{
+              ..._adminReport(report),
+              ..._publicReportForSession(
+                report,
+                sessionId: sessionId,
+                currentUser: _currentUser(_session(sessionId)),
+              ),
+            },
+          )
+          .toList(growable: false),
       'lineStats': lineStats.take(120).toList(growable: false),
       'catalog': <String, dynamic>{
         'lines': _adminCatalogLines(),
@@ -4338,7 +4358,12 @@ class PiwibusStore {
           ],
         ),
       ).catchError((Object error, StackTrace stackTrace) {
-        const OpsLogger().error('persist_start_trip_failed', {}, error, stackTrace);
+        const OpsLogger().error(
+          'persist_start_trip_failed',
+          {},
+          error,
+          stackTrace,
+        );
       }),
     );
     return _snapshotWithSystemTripCancellationNotices(
@@ -4886,7 +4911,12 @@ class PiwibusStore {
           ],
         ),
       ).catchError((Object error, StackTrace stackTrace) {
-        const OpsLogger().error('persist_stop_trip_failed', {}, error, stackTrace);
+        const OpsLogger().error(
+          'persist_stop_trip_failed',
+          {},
+          error,
+          stackTrace,
+        );
       }),
     );
     return snapshot(sessionId);
@@ -5200,7 +5230,8 @@ class PiwibusStore {
       'note': note.isEmpty
           ? "Signalement terrain partage depuis l\'application."
           : note,
-      'confidence': 0.78,
+      'confidence': 0.5,
+      'reactions': <String, dynamic>{},
     };
     reports.insert(0, report);
     _state['reports'] = reports;
@@ -5242,6 +5273,43 @@ class PiwibusStore {
         ],
       ),
     );
+    return snapshot(sessionId);
+  }
+
+  Future<JsonMap> setReportReaction(
+    String sessionId,
+    String reportId,
+    String? reaction,
+  ) async {
+    final session = _session(sessionId);
+    final reports = _reports();
+    final report = reports
+        .where((item) => _text(item['id']) == reportId)
+        .firstOrNull;
+    if (report == null) throw StateError('Alerte introuvable.');
+    final owner = _currentUser(session);
+    final ownerId = _text(owner?['id']);
+    final reporterId = _text(report['reporterId']);
+    final reporterSessionId = _text(report['reporterSessionId']);
+    if ((ownerId.isNotEmpty && ownerId == reporterId) ||
+        reporterSessionId == sessionId) {
+      throw StateError('L’auteur ne peut pas réagir à sa propre alerte.');
+    }
+    if (reaction != null && reaction != 'like' && reaction != 'dislike') {
+      throw StateError('Réaction invalide.');
+    }
+    final actorId = ownerId.isEmpty ? 'session:$sessionId' : 'user:$ownerId';
+    final reactions = <String, dynamic>{..._map(report['reactions'])};
+    if (reaction == null) {
+      reactions.remove(actorId);
+    } else {
+      reactions[actorId] = reaction;
+    }
+    report['reactions'] = reactions;
+    _updateReportConfidence(report);
+    _state['reports'] = reports;
+    _notifySharedChange();
+    await _persist(StateMutationBatch(reports: true));
     return snapshot(sessionId);
   }
 
@@ -5991,6 +6059,11 @@ class PiwibusStore {
   }
 
   JsonMap _publicReport(JsonMap report) {
+    final reactions = _map(report['reactions']);
+    final likeCount = reactions.values.where((value) => value == 'like').length;
+    final dislikeCount = reactions.values
+        .where((value) => value == 'dislike')
+        .length;
     return <String, dynamic>{
       'id': _text(report['id']),
       'busNumber': _text(report['busNumber']),
@@ -6002,7 +6075,39 @@ class PiwibusStore {
       'createdAt': _text(report['createdAt']),
       'note': _text(report['note']),
       'confidence': _double(report['confidence']),
+      'likeCount': likeCount,
+      'dislikeCount': dislikeCount,
+      'confirmationCount': likeCount,
     };
+  }
+
+  JsonMap _publicReportForSession(
+    JsonMap report, {
+    required String sessionId,
+    required JsonMap? currentUser,
+  }) {
+    final result = _publicReport(report);
+    final ownerId = _text(currentUser?['id']);
+    final reporterId = _text(report['reporterId']);
+    final reporterSessionId = _text(report['reporterSessionId']);
+    final isAuthor =
+        (ownerId.isNotEmpty && ownerId == reporterId) ||
+        reporterSessionId == sessionId;
+    final actorId = ownerId.isEmpty ? 'session:$sessionId' : 'user:$ownerId';
+    result['isReportAuthor'] = isAuthor;
+    result['currentReaction'] = isAuthor
+        ? null
+        : _map(report['reactions'])[actorId];
+    return result;
+  }
+
+  void _updateReportConfidence(JsonMap report) {
+    final reactions = _map(report['reactions']);
+    final likes = reactions.values.where((value) => value == 'like').length;
+    final dislikes = reactions.values
+        .where((value) => value == 'dislike')
+        .length;
+    report['confidence'] = (0.5 + (likes - dislikes) * 0.05).clamp(0.0, 1.0);
   }
 
   JsonMap _message({
@@ -6860,6 +6965,9 @@ class PiwibusStore {
       'lineCode': _normalizeCode(_text(lineCode)),
       'lineLabel': _text(input['lineLabel']),
       'reporterId': _text(input['reporterId'] ?? input['reporter_id']),
+      'reporterSessionId': _text(
+        input['reporterSessionId'] ?? input['reporter_session_id'],
+      ),
       'reporterName': _text(input['reporterName']),
       'location': <String, dynamic>{
         'lat': _double(locationMap['lat']),
@@ -6869,6 +6977,7 @@ class PiwibusStore {
       'createdAt': _dateValue(input['createdAt']),
       'note': _text(input['note']),
       'confidence': _double(input['confidence']),
+      'reactions': _map(input['reactions']),
     };
   }
 
@@ -8156,8 +8265,10 @@ class PiwibusStore {
       _sessionFlushTimer!.cancel();
       _sessionFlushTimer = null;
       await _persist(const StateMutationBatch(sessions: true)).catchError(
-        (Object e) =>
-            const OpsLogger().warning('session_flush_on_close_error', {'error': '$e'}),
+        (Object e) => const OpsLogger().warning(
+          'session_flush_on_close_error',
+          {'error': '$e'},
+        ),
       );
     }
     await _externalChangeSubscription?.cancel();
@@ -8295,6 +8406,12 @@ class PiwibusStore {
       throw StateError('$fieldName hors fenetre autorisee.');
     }
     return utc.toIso8601String();
+  }
+
+  static Map<String, dynamic> _map(Object? value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) return Map<String, dynamic>.from(value);
+    return <String, dynamic>{};
   }
 
   static double _double(Object? value) =>

@@ -572,7 +572,8 @@ class PostgresStatePersistence extends StatePersistence {
       final reportRows = await connection.execute('''
       SELECT
         id, sort_order, bus_number, line_code, line_label, reporter_id,
-        reporter_name, lat, lng, status, created_at, note, confidence
+        reporter_session_id, reporter_name, lat, lng, status, created_at, note, confidence,
+        reactions
       FROM piwibus_reports
       ORDER BY sort_order ASC, created_at DESC, id ASC
     ''');
@@ -585,6 +586,7 @@ class PostgresStatePersistence extends StatePersistence {
               'lineCode': _text(map['line_code']),
               'lineLabel': _text(map['line_label']),
               'reporterId': _text(map['reporter_id']),
+              'reporterSessionId': _text(map['reporter_session_id']),
               'reporterName': _text(map['reporter_name']),
               'location': <String, dynamic>{
                 'lat': _double(map['lat']),
@@ -594,6 +596,8 @@ class PostgresStatePersistence extends StatePersistence {
               'createdAt': _iso(map['created_at']),
               'note': _text(map['note']),
               'confidence': _double(map['confidence']),
+              'reactions':
+                  _jsonMapOrNull(map['reactions']) ?? const <String, dynamic>{},
             };
           })
           .toList(growable: false);
@@ -1608,12 +1612,13 @@ class PostgresStatePersistence extends StatePersistence {
           Sql.named('''
             INSERT INTO piwibus_reports (
               id, sort_order, bus_number, line_code, line_label, reporter_id,
-              reporter_name, lat, lng, status, created_at, note, confidence
+              reporter_session_id, reporter_name, lat, lng, status, created_at, note, confidence,
+              reactions
             )
             VALUES (
               @id, @sort_order, @bus_number, @line_code, @line_label,
-              @reporter_id, @reporter_name, @lat, @lng, @status, @created_at,
-              @note, @confidence
+              @reporter_id, @reporter_session_id, @reporter_name, @lat, @lng, @status, @created_at,
+              @note, @confidence, @reactions
             )
             ON CONFLICT (id) DO UPDATE SET
               sort_order = EXCLUDED.sort_order,
@@ -1621,13 +1626,15 @@ class PostgresStatePersistence extends StatePersistence {
               line_code = EXCLUDED.line_code,
               line_label = EXCLUDED.line_label,
               reporter_id = EXCLUDED.reporter_id,
+              reporter_session_id = EXCLUDED.reporter_session_id,
               reporter_name = EXCLUDED.reporter_name,
               lat = EXCLUDED.lat,
               lng = EXCLUDED.lng,
               status = EXCLUDED.status,
               created_at = EXCLUDED.created_at,
               note = EXCLUDED.note,
-              confidence = EXCLUDED.confidence
+              confidence = EXCLUDED.confidence,
+              reactions = EXCLUDED.reactions
           '''),
           parameters: <String, Object?>{
             'id': _text(row['id']),
@@ -1636,6 +1643,7 @@ class PostgresStatePersistence extends StatePersistence {
             'line_code': _text(row['lineCode']),
             'line_label': _text(row['lineLabel']),
             'reporter_id': _nullableText(row['reporterId']),
+            'reporter_session_id': _nullableText(row['reporterSessionId']),
             'reporter_name': _text(row['reporterName']),
             'lat': _finiteDouble(location['lat']),
             'lng': _finiteDouble(location['lng']),
@@ -1643,6 +1651,7 @@ class PostgresStatePersistence extends StatePersistence {
             'created_at': _dateTime(row['createdAt']),
             'note': _text(row['note']),
             'confidence': _finiteDouble(row['confidence']),
+            'reactions': jsonEncode(row['reactions'] ?? const {}),
           },
           ignoreRows: true,
         );
@@ -2108,7 +2117,9 @@ class PostgresStatePersistence extends StatePersistence {
     final hasMaxConnectionCount = queryParameters.containsKey(
       'max_connection_count',
     );
-    if (hasSslMode && hasMaxConnectionCount && !uri.queryParameters.containsKey('channel_binding')) {
+    if (hasSslMode &&
+        hasMaxConnectionCount &&
+        !uri.queryParameters.containsKey('channel_binding')) {
       return databaseUrl;
     }
     return uri
@@ -2337,14 +2348,24 @@ class PostgresStatePersistence extends StatePersistence {
           line_code text NOT NULL,
           line_label text NOT NULL,
           reporter_id text,
+          reporter_session_id text,
           reporter_name text NOT NULL,
           lat double precision NOT NULL,
           lng double precision NOT NULL,
           status text NOT NULL,
           created_at timestamptz NOT NULL,
           note text NOT NULL,
-          confidence double precision NOT NULL
+          confidence double precision NOT NULL,
+          reactions jsonb NOT NULL DEFAULT '{}'::jsonb
         )
+        ''',
+        '''
+        ALTER TABLE piwibus_reports
+        ADD COLUMN IF NOT EXISTS reporter_session_id text
+        ''',
+        '''
+        ALTER TABLE piwibus_reports
+        ADD COLUMN IF NOT EXISTS reactions jsonb NOT NULL DEFAULT '{}'::jsonb
         ''',
         '''
         CREATE INDEX IF NOT EXISTS piwibus_reports_status_created_idx

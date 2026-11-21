@@ -49,13 +49,31 @@ Future<void> main(List<String> args) async {
   late final PostgresStatePersistence neon;
   try {
     neon = await PostgresStatePersistence.open(neonUrl);
+    // Charge la revision actuelle de Neon pour initialiser _loadedRevision
+    await neon.loadState();
   } catch (e) {
     stderr.writeln('Erreur de connexion a Neon: $e');
     await supabase.close();
     exit(1);
   }
 
-  stdout.writeln('3. Importation des donnees dans Neon...');
+  // Filtrer les 1600+ vieilles sessions mortes pour ne pas polluer la nouvelle base
+  // On ne garde que les sessions récentes (dernières 24h)
+  final rawSessions = (state['sessions'] as Map?) ?? const {};
+  final cutoff = DateTime.now().subtract(const Duration(hours: 24));
+  final cleanSessions = <String, dynamic>{};
+  for (final entry in rawSessions.entries) {
+    final sessionMap = entry.value as Map?;
+    if (sessionMap == null) continue;
+    final lastSeen = DateTime.tryParse(sessionMap['lastSeenAt']?.toString() ?? '');
+    if (lastSeen != null && lastSeen.isAfter(cutoff)) {
+      cleanSessions[entry.key.toString()] = entry.value;
+    }
+  }
+  state['sessions'] = cleanSessions;
+  stdout.writeln('  (Sessions nettoyees : ${cleanSessions.length} actives conservees sur ${rawSessions.length})');
+
+  stdout.writeln('\n3. Importation des donnees dans Neon...');
   try {
     await neon.saveState(state);
     stdout.writeln('\n🎉 Migration terminee avec succes !');
