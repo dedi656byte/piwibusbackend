@@ -2348,24 +2348,14 @@ class PostgresStatePersistence extends StatePersistence {
           line_code text NOT NULL,
           line_label text NOT NULL,
           reporter_id text,
-          reporter_session_id text,
           reporter_name text NOT NULL,
           lat double precision NOT NULL,
           lng double precision NOT NULL,
           status text NOT NULL,
           created_at timestamptz NOT NULL,
           note text NOT NULL,
-          confidence double precision NOT NULL,
-          reactions jsonb NOT NULL DEFAULT '{}'::jsonb
+          confidence double precision NOT NULL
         )
-        ''',
-        '''
-        ALTER TABLE piwibus_reports
-        ADD COLUMN IF NOT EXISTS reporter_session_id text
-        ''',
-        '''
-        ALTER TABLE piwibus_reports
-        ADD COLUMN IF NOT EXISTS reactions jsonb NOT NULL DEFAULT '{}'::jsonb
         ''',
         '''
         CREATE INDEX IF NOT EXISTS piwibus_reports_status_created_idx
@@ -2996,6 +2986,20 @@ class PostgresStatePersistence extends StatePersistence {
         CREATE INDEX IF NOT EXISTS piwibus_outbox_pending_idx
         ON piwibus_outbox (event_type, available_at, created_at)
         WHERE status IN ('pending', 'processing')
+        ''',
+      ],
+    );
+    await _applyMigration(
+      connection,
+      version: 25,
+      statements: const <String>[
+        '''
+        ALTER TABLE piwibus_reports
+        ADD COLUMN IF NOT EXISTS reporter_session_id text
+        ''',
+        '''
+        ALTER TABLE piwibus_reports
+        ADD COLUMN IF NOT EXISTS reactions jsonb NOT NULL DEFAULT '{}'::jsonb
         ''',
       ],
     );
