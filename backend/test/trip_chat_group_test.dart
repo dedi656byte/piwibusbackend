@@ -517,7 +517,6 @@ void main() {
               .toList(),
           <int>[1, 1],
         );
-
         await store.pinMessage('actions-bob', conversationId, firstMessageId);
         await store.pinMessage(
           'actions-charlie',
@@ -536,6 +535,15 @@ void main() {
             .messageConversationsForSession('actions-bob')
             .firstWhere((item) => item['id'] == conversationId);
         expect(bobConversation['pinnedMessages'], hasLength(2));
+        await expectLater(
+          store.setMessageReaction(
+            'actions-bob',
+            conversationId,
+            firstMessageId,
+            <String, dynamic>{},
+          ),
+          throwsStateError,
+        );
         await expectLater(
           store.setMessageReaction(
             'actions-outsider',
@@ -659,6 +667,18 @@ void main() {
             .conversationMessages('actions-bob', conversationId)
             .firstWhere((item) => item['id'] == firstMessageId);
         expect(reloadedMessage['reactions'], hasLength(2));
+        await store.setMessageReaction(
+          'actions-charlie',
+          conversationId,
+          firstMessageId,
+          <String, dynamic>{'emoji': null},
+        );
+        bobFirstMessage = store
+            .conversationMessages('actions-bob', conversationId)
+            .firstWhere((item) => item['id'] == firstMessageId);
+        expect(bobFirstMessage['reactions'], <Map<String, dynamic>>[
+          <String, dynamic>{'emoji': '👍', 'count': 1, 'reactedByMe': true},
+        ]);
         final reloadedReply = store
             .conversationMessages('actions-charlie', conversationId)
             .firstWhere((item) => item['id'] == replyMessageId);
@@ -930,9 +950,10 @@ class _CapturingStatePersistence extends JsonFileStatePersistence {
   Future<void> applyMutations({
     required Map<String, dynamic> state,
     required StateMutationBatch batch,
+    bool priority = false,
   }) async {
     outboxEvents.addAll(batch.outboxEvents);
-    await super.applyMutations(state: state, batch: batch);
+    await super.applyMutations(state: state, batch: batch, priority: priority);
   }
 }
 

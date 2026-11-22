@@ -3209,16 +3209,31 @@ class PiwibusStore {
       messageId,
       currentUserId,
     );
-    final emoji = _validReactionEmoji(body['emoji']);
+    if (!body.containsKey('emoji')) {
+      throw StateError('Réaction invalide.');
+    }
+    final emoji = body['emoji'] == null
+        ? null
+        : _validReactionEmoji(body['emoji']);
     final reactions = _stringMap(target.message['reactions']);
-    if (reactions[currentUserId] == emoji) {
+    if (emoji == null) {
+      if (!reactions.containsKey(currentUserId)) {
+        return _messageActionResult(
+          target.message,
+          target.conversation,
+          currentUserId,
+        );
+      }
+      reactions.remove(currentUserId);
+    } else if (reactions[currentUserId] != emoji) {
+      reactions[currentUserId] = emoji;
+    } else {
       return _messageActionResult(
         target.message,
         target.conversation,
         currentUserId,
       );
     }
-    reactions[currentUserId] = emoji;
     target.message['reactions'] = reactions;
     _advanceMessageRevision(target.conversation, target.message);
     target.conversation['messages'] = target.messages;
