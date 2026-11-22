@@ -32,6 +32,7 @@ class RedisRealtime {
   Timer? _commandReconnectTimer;
   Future<void>? _commandReconnectFuture;
   RedisConnection? _commandReconnectConnection;
+  Completer<void> _subscriptionReadySignal = Completer<void>();
   int _commandReconnectAttempt = 0;
   DateTime? _lastRateLimitErrorLogAt;
   bool _closed = false;
@@ -46,6 +47,20 @@ class RedisRealtime {
     final response = await _sendCommand(const ['PING']);
     if (response?.toString().toUpperCase() != 'PONG') {
       throw StateError('Redis command connection did not return PONG.');
+    }
+    if (!_subscriptionReady) {
+      try {
+        await _subscriptionReadySignal.future.timeout(
+          const Duration(seconds: 4),
+        );
+      } on TimeoutException {
+        throw StateError(
+          'Redis realtime subscription did not recover within 4 seconds.',
+        );
+      }
+    }
+    if (_closed) {
+      throw StateError('Redis realtime is closed.');
     }
     if (!_subscriptionReady) {
       throw StateError('Redis realtime subscription is not active.');
@@ -358,6 +373,9 @@ class RedisRealtime {
 
   Future<void> close() async {
     _closed = true;
+    if (!_subscriptionReadySignal.isCompleted) {
+      _subscriptionReadySignal.complete();
+    }
     _reconnectTimer?.cancel();
     _commandReconnectTimer?.cancel();
     await _subscription?.cancel();
@@ -535,6 +553,9 @@ class RedisRealtime {
     if (kind == 'subscribe' && channel == config.channel) {
       final wasReady = _subscriptionReady;
       _subscriptionReady = true;
+      if (!_subscriptionReadySignal.isCompleted) {
+        _subscriptionReadySignal.complete();
+      }
       if (!wasReady) {
         logger.info('Redis subscription ready', {
           'host': config.host,
@@ -566,6 +587,9 @@ class RedisRealtime {
   void _scheduleReconnect() {
     if (_closed) return;
     _subscriptionReady = false;
+    if (_subscriptionReadySignal.isCompleted) {
+      _subscriptionReadySignal = Completer<void>();
+    }
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(seconds: 3), () async {
       if (_closed) return;

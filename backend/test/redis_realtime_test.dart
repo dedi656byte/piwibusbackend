@@ -110,11 +110,12 @@ void main() {
         server.closeSubscriptionConnection();
 
         await _waitUntil(
-          () =>
-              realtime.isSubscriptionReady &&
-              server.subscriptionCount > subscriptionsBefore,
-          reason: 'Redis subscription should reconnect after a closed socket',
+          () => !realtime.isSubscriptionReady,
+          reason: 'Redis subscription should report the closed socket',
         );
+        await realtime.checkReady().timeout(const Duration(seconds: 5));
+        expect(realtime.isSubscriptionReady, isTrue);
+        expect(server.subscriptionCount, greaterThan(subscriptionsBefore));
       } finally {
         await realtime.close();
         await server.close();
