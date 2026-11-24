@@ -61,6 +61,8 @@ class StateOutboxEvent {
 }
 
 abstract class StatePersistence {
+  Future<void> _mutationOperations = Future<void>.value();
+
   String get name;
   bool get isDatabaseBacked => false;
   bool get supportsGeospatialQueries => false;
@@ -101,9 +103,37 @@ abstract class StatePersistence {
     required Map<String, dynamic> state,
     required StateMutationBatch batch,
     bool priority = false,
-  }) async {
-    if (batch.isEmpty) return;
-    await saveState(state);
+  }) {
+    if (batch.isEmpty) return Future<void>.value();
+    final previousOperation = _mutationOperations;
+    final operationFinished = Completer<void>();
+    _mutationOperations = operationFinished.future;
+
+    return () async {
+      try {
+        await previousOperation;
+        final mergedState = await loadState() ?? <String, dynamic>{};
+        void replaceSection(String key, bool shouldReplace) {
+          if (!shouldReplace) return;
+          if (state.containsKey(key)) {
+            mergedState[key] = jsonDecode(jsonEncode(state[key]));
+          } else {
+            mergedState.remove(key);
+          }
+        }
+
+        replaceSection('users', batch.users);
+        replaceSection('sessions', batch.sessions);
+        replaceSection('trips', batch.trips);
+        replaceSection('reports', batch.reports);
+        replaceSection('pushTokens', batch.pushTokens);
+        replaceSection('activity', batch.activity);
+        replaceSection('messageConversations', batch.messageConversations);
+        await saveState(mergedState);
+      } finally {
+        operationFinished.complete();
+      }
+    }();
   }
 
   Future<List<Map<String, dynamic>>> nearbyActiveTrips({

@@ -4666,91 +4666,273 @@ class PiwibusStore {
     return notices;
   }
 
+  Object? _mergeStateChanges(Object? base, Object? updated, Object? latest) {
+    if (_jsonValuesEqual(base, updated)) return latest;
+    if (_jsonValuesEqual(base, latest)) return _copyJsonValue(updated);
+
+    if (base is Map && updated is Map && latest is Map) {
+      final merged = Map<String, dynamic>.from(latest);
+      final keys = <Object?>{...base.keys, ...updated.keys};
+      for (final key in keys) {
+        final hasBase = base.containsKey(key);
+        final hasUpdated = updated.containsKey(key);
+        final hasLatest = latest.containsKey(key);
+        final baseValue = base[key];
+        final updatedValue = updated[key];
+        if (_jsonValuesEqual(baseValue, updatedValue) &&
+            hasBase == hasUpdated) {
+          continue;
+        }
+        if (!hasLatest) {
+          if (!hasUpdated) continue;
+          if (!hasBase) {
+            merged[_text(key)] = _copyJsonValue(updatedValue);
+          }
+          continue;
+        }
+        if (!hasUpdated) {
+          if (hasBase && _jsonValuesEqual(latest[key], baseValue)) {
+            merged.remove(key);
+          }
+          continue;
+        }
+        if (!hasBase) {
+          continue;
+        }
+        merged[_text(key)] = _mergeStateChanges(
+          baseValue,
+          updatedValue,
+          latest[key],
+        );
+      }
+      return merged;
+    }
+
+    if (base is List && updated is List && latest is List) {
+      if (_hasStableJsonIds(base) &&
+          _hasStableJsonIds(updated) &&
+          _hasStableJsonIds(latest)) {
+        return _mergeStateListById(base, updated, latest);
+      }
+      if (_hasOnlyJsonScalars(base) &&
+          _hasOnlyJsonScalars(updated) &&
+          _hasOnlyJsonScalars(latest)) {
+        final merged = List<dynamic>.from(latest);
+        for (final value in base) {
+          if (!updated.any((item) => _jsonValuesEqual(item, value))) {
+            final index = merged.indexWhere(
+              (item) => _jsonValuesEqual(item, value),
+            );
+            if (index >= 0) merged.removeAt(index);
+          }
+        }
+        for (final value in updated) {
+          if (!base.any((item) => _jsonValuesEqual(item, value)) &&
+              !merged.any((item) => _jsonValuesEqual(item, value))) {
+            merged.add(_copyJsonValue(value));
+          }
+        }
+        return merged;
+      }
+    }
+
+    return latest;
+  }
+
+  List<JsonMap> _mergeStateListById(List base, List updated, List latest) {
+    final baseById = _jsonListById(base);
+    final updatedById = _jsonListById(updated);
+    final latestById = _jsonListById(latest);
+    final merged = latest
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+
+    for (final id in <String>{...baseById.keys, ...updatedById.keys}) {
+      final hasBase = baseById.containsKey(id);
+      final hasUpdated = updatedById.containsKey(id);
+      final hasLatest = latestById.containsKey(id);
+      if (hasBase == hasUpdated &&
+          _jsonValuesEqual(baseById[id], updatedById[id])) {
+        continue;
+      }
+      final latestIndex = merged.indexWhere((item) => _text(item['id']) == id);
+      if (!hasUpdated) {
+        if (hasLatest &&
+            hasBase &&
+            _jsonValuesEqual(latestById[id], baseById[id])) {
+          merged.removeAt(latestIndex);
+        }
+        continue;
+      }
+      if (!hasBase) {
+        if (!hasLatest) {
+          merged.insert(
+            _jsonListInsertionIndex(updated, id, merged),
+            Map<String, dynamic>.from(updatedById[id]!),
+          );
+        }
+        continue;
+      }
+      if (!hasLatest || latestIndex < 0) continue;
+      merged[latestIndex] =
+          _mergeStateChanges(baseById[id], updatedById[id], latestById[id])
+              as JsonMap;
+    }
+    return merged;
+  }
+
+  Map<String, JsonMap> _jsonListById(List values) => <String, JsonMap>{
+    for (final value in values)
+      if (value is Map && _text(value['id']).isNotEmpty)
+        _text(value['id']): Map<String, dynamic>.from(value),
+  };
+
+  int _jsonListInsertionIndex(List values, String id, List<JsonMap> latest) {
+    final stagedIndex = values.indexWhere(
+      (item) => item is Map && _text(item['id']) == id,
+    );
+    if (stagedIndex <= 0) return 0;
+    for (var index = stagedIndex - 1; index >= 0; index -= 1) {
+      final previous = values[index];
+      if (previous is! Map) continue;
+      final previousId = _text(previous['id']);
+      final latestIndex = latest.indexWhere(
+        (item) => _text(item['id']) == previousId,
+      );
+      if (latestIndex >= 0) return latestIndex + 1;
+    }
+    return 0;
+  }
+
+  bool _hasStableJsonIds(List values) =>
+      values.isNotEmpty &&
+      values.every((value) => value is Map && _text(value['id']).isNotEmpty);
+
+  bool _hasOnlyJsonScalars(List values) => values.every(
+    (value) =>
+        value == null || value is String || value is num || value is bool,
+  );
+
+  bool _jsonValuesEqual(Object? first, Object? second) =>
+      jsonEncode(first) == jsonEncode(second);
+
+  Object? _copyJsonValue(Object? value) => jsonDecode(jsonEncode(value));
+
   Future<List<JsonMap>> expireStaleActiveTrips({
     Duration timeout = const Duration(seconds: 150),
   }) async {
     final now = DateTime.now().toUtc();
     final nowIso = now.toIso8601String();
-    final trips = _trips();
+    final staleTripIds = <String>{};
+    for (final trip in _trips()) {
+      if (_text(trip['status']) != 'actif') continue;
+      final lastUpdatedAt = DateTime.tryParse(_text(trip['lastUpdatedAt']));
+      if (lastUpdatedAt == null ||
+          now.difference(lastUpdatedAt.toUtc()) < timeout) {
+        continue;
+      }
+      final tripId = _text(trip['id']);
+      if (tripId.isNotEmpty) staleTripIds.add(tripId);
+    }
+    if (staleTripIds.isEmpty) return const <JsonMap>[];
+
+    final currentState = _state;
+    final originalState = Map<String, dynamic>.from(
+      jsonDecode(jsonEncode(currentState)) as Map,
+    );
+    final stagedState = Map<String, dynamic>.from(
+      jsonDecode(jsonEncode(currentState)) as Map,
+    );
     final expiredNotices = <JsonMap>[];
     var usersChanged = false;
 
-    for (final trip in trips) {
-      if (_text(trip['status']) != 'actif') continue;
-      final lastUpdatedAt = DateTime.tryParse(_text(trip['lastUpdatedAt']));
-      if (lastUpdatedAt == null) continue;
-      if (now.difference(lastUpdatedAt.toUtc()) < timeout) continue;
+    late final List<StateOutboxEvent> cancellationPushEvents;
+    _state = stagedState;
+    try {
+      final trips = _trips();
+      for (final trip in trips) {
+        final tripId = _text(trip['id']);
+        if (_text(trip['status']) != 'actif' ||
+            !staleTripIds.contains(tripId)) {
+          continue;
+        }
 
-      final tripId = _text(trip['id']);
-      final lineCode = _text(trip['line_code']);
-      final lineLabel = _displayCode(lineCode);
-      final lineName = _routeTitle(lineByCode(lineCode));
-      final busLabel = lineName.isEmpty
-          ? 'ligne $lineLabel'
-          : 'ligne $lineLabel - $lineName';
-      final liveLocation = trip['liveLocation'];
-      final lat = liveLocation is Map
-          ? _double(liveLocation['lat'] ?? liveLocation['latitude'])
-          : double.nan;
-      final lng = liveLocation is Map
-          ? _double(liveLocation['lng'] ?? liveLocation['longitude'])
-          : double.nan;
-      final hasLastLocation = _isValidLatLng(lat, lng);
-      final locationSuffix = hasLastLocation
-          ? ' Derniere position GPS: ${lat.toStringAsFixed(5)} / ${lng.toStringAsFixed(5)}.'
-          : ' Derniere position GPS indisponible.';
-      final timeoutLabel = _durationLabel(timeout);
-      final reason =
-          "Trajet live interrompu automatiquement : l\'Etoile du bus "
-          '$busLabel ne communique plus avec le serveur depuis plus de $timeoutLabel.';
-      final audience = notificationAudienceForTrip(tripId);
+        final lineCode = _text(trip['line_code']);
+        final lineLabel = _displayCode(lineCode);
+        final lineName = _routeTitle(lineByCode(lineCode));
+        final busLabel = lineName.isEmpty
+            ? 'ligne $lineLabel'
+            : 'ligne $lineLabel - $lineName';
+        final liveLocation = trip['liveLocation'];
+        final lat = liveLocation is Map
+            ? _double(liveLocation['lat'] ?? liveLocation['latitude'])
+            : double.nan;
+        final lng = liveLocation is Map
+            ? _double(liveLocation['lng'] ?? liveLocation['longitude'])
+            : double.nan;
+        final hasLastLocation = _isValidLatLng(lat, lng);
+        final locationSuffix = hasLastLocation
+            ? ' Derniere position GPS: ${lat.toStringAsFixed(5)} / ${lng.toStringAsFixed(5)}.'
+            : ' Derniere position GPS indisponible.';
+        final timeoutLabel = _durationLabel(timeout);
+        final reason =
+            "Trajet live interrompu automatiquement : l\'Etoile du bus "
+            '$busLabel ne communique plus avec le serveur depuis plus de $timeoutLabel.';
+        final audience = notificationAudienceForTrip(tripId);
 
-      trip['status'] = 'termine';
-      trip['lastUpdatedAt'] = nowIso;
-      final messages = List<JsonMap>.from(
-        trip['messages'] as List? ?? const [],
-      );
-      messages.add(
-        _message(
-          id: _newEntityId('sys-timeout-$tripId'),
-          tripId: tripId,
-          authorName: 'Systeme',
-          role: 'administrateur',
-          content: '$reason$locationSuffix',
-          createdAt: nowIso,
-          isSystem: true,
-        ),
-      );
-      trip['messages'] = messages;
-      usersChanged = _rememberStarTripForOwner(trip) || usersChanged;
-      addActivity(
-        title: 'Trajet live interrompu',
-        subtitle: 'Bus $busLabel. $reason$locationSuffix',
-        iconKey: 'stop',
-        colorValue: 0xFFD1495B,
-        audienceSessionIds: audience.sessionIds,
-        activityId: 'trip-interrupted:$tripId',
-      );
-      expiredNotices.add(<String, dynamic>{
-        'notificationType': 'trip_stopped_timeout',
-        'tripId': tripId,
-        'lineCode': lineCode,
-        'lineLabel': busLabel,
-        'reason': reason,
-        'lastLocation': hasLastLocation
-            ? <String, dynamic>{'lat': lat, 'lng': lng}
-            : null,
-        'tokens': audience.tokens,
-        'audienceSessionIds': audience.sessionIds.toList(growable: false),
-      });
+        trip['status'] = 'termine';
+        trip['lastUpdatedAt'] = nowIso;
+        final messages = List<JsonMap>.from(
+          trip['messages'] as List? ?? const [],
+        );
+        messages.add(
+          _message(
+            id: _newEntityId('sys-timeout-$tripId'),
+            tripId: tripId,
+            authorName: 'Systeme',
+            role: 'administrateur',
+            content: '$reason$locationSuffix',
+            createdAt: nowIso,
+            isSystem: true,
+          ),
+        );
+        trip['messages'] = messages;
+        usersChanged = _rememberStarTripForOwner(trip) || usersChanged;
+        addActivity(
+          title: 'Trajet live interrompu',
+          subtitle: 'Bus $busLabel. $reason$locationSuffix',
+          iconKey: 'stop',
+          colorValue: 0xFFD1495B,
+          audienceSessionIds: audience.sessionIds,
+          activityId: 'trip-interrupted:$tripId',
+        );
+        expiredNotices.add(<String, dynamic>{
+          'notificationType': 'trip_stopped_timeout',
+          'tripId': tripId,
+          'lineCode': lineCode,
+          'lineLabel': busLabel,
+          'reason': reason,
+          'lastLocation': hasLastLocation
+              ? <String, dynamic>{'lat': lat, 'lng': lng}
+              : null,
+          'tokens': audience.tokens,
+          'audienceSessionIds': audience.sessionIds.toList(growable: false),
+        });
+      }
+      _state['trips'] = trips;
+      cancellationPushEvents = expiredNotices
+          .map(pushEventForTripCancellation)
+          .whereType<StateOutboxEvent>()
+          .toList(growable: false);
+      _state = currentState;
+    } catch (error, stackTrace) {
+      _state = currentState;
+      Error.throwWithStackTrace(error, stackTrace);
     }
-    if (expiredNotices.isEmpty) return const <JsonMap>[];
-    _state['trips'] = trips;
-    final cancellationPushEvents = expiredNotices
-        .map(pushEventForTripCancellation)
-        .whereType<StateOutboxEvent>()
-        .toList(growable: false);
-    _notifySharedChange();
+    if (expiredNotices.isEmpty) {
+      _state = currentState;
+      return const <JsonMap>[];
+    }
     await _persist(
       StateMutationBatch(
         users: usersChanged,
@@ -4758,7 +4940,29 @@ class PiwibusStore {
         activity: true,
         outboxEvents: cancellationPushEvents,
       ),
+      state: stagedState,
     );
+    final latestState = _state;
+    final concurrentChanges = StateMutationBatch(
+      users:
+          !_jsonValuesEqual(latestState['users'], originalState['users']) &&
+          !_jsonValuesEqual(latestState['users'], stagedState['users']),
+      trips:
+          !_jsonValuesEqual(latestState['trips'], originalState['trips']) &&
+          !_jsonValuesEqual(latestState['trips'], stagedState['trips']),
+      activity:
+          !_jsonValuesEqual(
+            latestState['activity'],
+            originalState['activity'],
+          ) &&
+          !_jsonValuesEqual(latestState['activity'], stagedState['activity']),
+    );
+    final mergedState =
+        _mergeStateChanges(originalState, stagedState, latestState) as JsonMap;
+    _state = mergedState;
+    if (!concurrentChanges.isEmpty) {
+      await _persist(concurrentChanges, state: mergedState);
+    }
     return expiredNotices;
   }
 
